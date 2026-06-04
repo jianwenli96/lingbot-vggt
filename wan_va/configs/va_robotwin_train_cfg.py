@@ -6,13 +6,18 @@ import os
 va_robotwin_train_cfg = EasyDict(__name__='Config: VA robotwin train')
 va_robotwin_train_cfg.update(va_robotwin_cfg)
 
+va_robotwin_train_cfg.resume_from = '/path/to/pretrained/model'
+
 va_robotwin_train_cfg.dataset_path = '/path/to/your/dataset'
 va_robotwin_train_cfg.empty_emb_path = os.path.join(va_robotwin_train_cfg.dataset_path, 'empty_emb.pt')
 va_robotwin_train_cfg.enable_wandb = True
 va_robotwin_train_cfg.load_worker = 16
-va_robotwin_train_cfg.save_interval = 1000
+va_robotwin_train_cfg.save_interval = 200
 va_robotwin_train_cfg.gc_interval = 50
 va_robotwin_train_cfg.cfg_prob = 0.1
+va_robotwin_train_cfg.random_frame_cut = False
+va_robotwin_train_cfg.min_frames = 16
+va_robotwin_train_cfg.max_frames = 24
 
 # Training parameters
 va_robotwin_train_cfg.learning_rate = 1e-5

@@ -6,13 +6,18 @@ import os
 va_demo_train_cfg = EasyDict(__name__='Config: VA demo train')
 va_demo_train_cfg.update(va_demo_cfg)
 
+va_demo_train_cfg.resume_from = '/path/to/pretrained/model'
+
 va_demo_train_cfg.dataset_path = '/path/to/your/dataset'
 va_demo_train_cfg.empty_emb_path = os.path.join(va_demo_train_cfg.dataset_path, 'empty_emb.pt')
 va_demo_train_cfg.enable_wandb = True
 va_demo_train_cfg.load_worker = 16
-va_demo_train_cfg.save_interval = 50
+va_demo_train_cfg.save_interval = 200
 va_demo_train_cfg.gc_interval = 50
 va_demo_train_cfg.cfg_prob = 0.1
+va_demo_train_cfg.random_frame_cut = False
+va_demo_train_cfg.min_frames = 16
+va_demo_train_cfg.max_frames = 24
 
 # Training parameters
 va_demo_train_cfg.learning_rate = 1e-4

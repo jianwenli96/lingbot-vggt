@@ -4,7 +4,7 @@ set -x
 
 umask 007
  
-NGPU=${NGPU:-"8"}
+NGPU=${NGPU:-"2"}
 MASTER_PORT=${MASTER_PORT:-"29501"}
 PORT=${PORT:-"1106"}
 LOG_RANK=${LOG_RANK:-"0"}
@@ -16,11 +16,6 @@ if [ $# -ne 0 ]; then
     overrides="$*"
 fi
 
-export WANDB_API_KEY="your key"
-export WANDB_BASE_URL="your url"
-export WANDB_TEAM_NAME="your team name"
-export WANDB_PROJECT="your project"
-
 ## node setting
 num_gpu=${NGPU}
 master_port=${MASTER_PORT}
@@ -29,8 +24,10 @@ torchft_lighthouse=${TORCHFT_LIGHTHOUSE}
 config_name=${CONFIG_NAME}
 
 ## cmd setting
+export HF_DATASETS_CACHE="/efs-gy1/Caches/hf_dataset_cache"
 export TOKENIZERS_PARALLELISM=false
-PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" TORCHFT_LIGHTHOUSE=${torchft_lighthouse} \
+export LOG_TIME=$(date +%Y%m%d_%H%M%S)
+PYTORCH_NPU_ALLOC_CONF="expandable_segments:True" TORCHFT_LIGHTHOUSE=${torchft_lighthouse} \
 python -m torch.distributed.run \
     --nproc_per_node=${num_gpu} \
     --local-ranks-filter=${log_rank} \

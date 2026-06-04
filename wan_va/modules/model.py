@@ -26,18 +26,230 @@ from torch.nn.attention.flex_attention import (
 )
 from functools import partial
 
-try:
-    from flash_attn_interface import flash_attn_func
-except:
-    from flash_attn import flash_attn_func
-
 __all__ = ['WanTransformer3DModel']
 
 
-def custom_sdpa(q, k, v):
+def custom_sdpa(q, k, v, **kwargs):
     out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2),
                                          v.transpose(1, 2))
     return out.transpose(1, 2)
+
+
+class SDPAAttnFunc(nn.Module):
+    """
+    使用PyTorch原生SDPA实现FlexAttnFunc的attention mask功能
+    将FlexAttention的BlockMask转换为标准的attention mask张量
+    """
+    # attention_mask: ClassVar[torch.Tensor] = None
+    # cross_attention_mask: ClassVar[torch.Tensor] = None
+    seq_len: ClassVar[int] = None
+    text_seq_len: ClassVar[int] = None
+
+    def __init__(
+        self,
+        is_cross=False,
+    ) -> None:
+        super().__init__()
+        self.is_cross = is_cross
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor,
+        cross_attention_mask: torch.Tensor,
+        dtype=torch.bfloat16,
+    ) -> torch.Tensor:
+        """
+        前向传播
+        query, key, value: [B, S, N, D] 格式
+        """
+        q_varlen = rearrange(query[0], "s n d -> 1 n s d")
+        k_varlen = rearrange(key[0], "s n d -> 1 n s d")
+        v_varlen = rearrange(value[0], "s n d -> 1 n s d")
+
+        half_dtypes = (torch.float16, torch.bfloat16)
+        assert dtype in half_dtypes
+        def half(x):
+            return x if x.dtype in half_dtypes else x.to(dtype)
+
+        q_varlen = half(q_varlen)
+        k_varlen = half(k_varlen)
+        v_varlen = half(v_varlen)
+        q_varlen = q_varlen.to(v_varlen.dtype)
+        k_varlen = k_varlen.to(v_varlen.dtype)
+
+        # 选择对应的attention mask
+        # attn_mask = SDPAAttnFunc.cross_attention_mask if self.is_cross else SDPAAttnFunc.attention_mask
+        attn_mask = cross_attention_mask if self.is_cross else attention_mask
+        attn_mask = attn_mask.to(query.device).bool() # 放到设备上 + 设置dtype
+        # 使用SDPA计算注意力
+        x_out = F.scaled_dot_product_attention(
+            q_varlen, k_varlen, v_varlen, attn_mask=attn_mask)
+
+        x_out = rearrange(x_out, "b n s d -> b s n d")
+        return x_out
+
+    @staticmethod
+    @torch.no_grad()
+    def init_mask(
+        latent_shape,
+        action_shape,
+        padded_length,
+        chunk_size,
+        window_size,
+        patch_size,
+        device,
+        dtype,
+    ):
+        """
+        初始化attention mask
+        将FlexAttention的掩码逻辑转换为标准的布尔或浮点掩码张量
+        """
+        B, _, L_F, L_H, L_W = latent_shape
+        _, _, A_F, A_H, A_W = action_shape
+
+        # 构建序列ID
+        latent_seq_id = torch.arange(B)[:, None, None, None].\
+            expand(-1, L_F // patch_size[0], L_H // patch_size[1], L_W // patch_size[2]).flatten()
+        action_seq_id = torch.arange(B)[:, None, None, None].expand(-1, A_F, A_H, A_W).flatten()
+        seq_ids = torch.cat([latent_seq_id] * 2 + [action_seq_id] * 2)
+
+        # 构建帧ID
+        latent_frame_id = torch.arange(L_F)[None, :, None, None].expand(B, -1, L_H // patch_size[1], L_W // patch_size[2])[None].flatten()
+        action_frame_id = torch.arange(A_F)[None, :, None, None].expand(B, -1, A_H, A_W)[None].flatten()
+        frame_ids = torch.cat([latent_frame_id // chunk_size * 2] * 2 + [action_frame_id // chunk_size * 2 + 1] * 2)
+
+        # 构建noise ID
+        noise_ids = torch.cat(
+            [
+                torch.zeros_like(latent_frame_id),
+                torch.ones_like(latent_frame_id),
+                torch.zeros_like(action_frame_id),
+                torch.ones_like(action_frame_id),
+            ]
+        )
+
+        # Padding
+        seq_ids = F.pad(seq_ids, (0, padded_length), value=-1)
+        frame_ids = F.pad(frame_ids, (0, padded_length), value=-1)
+        noise_ids = F.pad(noise_ids, (0, padded_length), value=-1)
+
+        seq_ids = seq_ids.long().to(device)
+        frame_ids = frame_ids.long().to(device)
+        noise_ids = noise_ids.long().to(device)
+
+        # 生成自注意力掩码
+        attention_mask = SDPAAttnFunc._create_attention_mask(
+            seq_ids, frame_ids, noise_ids, window_size, device
+        )
+        # visualize_npu_mask(attention_mask, tokens=None, title="Causal Attention", save_path="Causal_attention_mask.png")
+        # SDPAAttnFunc.attention_mask = attention_mask.to(dtype)
+        SDPAAttnFunc.seq_len = len(seq_ids)
+
+        # 生成交叉注意力掩码
+        text_seq_ids = torch.arange(B)[:, None].expand(-1, 512).flatten()
+        text_seq_ids = text_seq_ids.long().to(device)
+        cross_attention_mask = SDPAAttnFunc._create_cross_attention_mask(
+            seq_ids, text_seq_ids, device
+        )
+        # visualize_npu_mask(cross_attention_mask, tokens=None, title="Cross Attention", save_path="cross_attention_mask.png")
+        # SDPAAttnFunc.cross_attention_mask = cross_attention_mask.to(dtype)
+        SDPAAttnFunc.text_seq_len = len(text_seq_ids)
+        return attention_mask, cross_attention_mask
+
+    @staticmethod
+    @torch.no_grad()
+    def _create_cross_attention_mask(seq_ids, text_seq_ids, device):
+        """
+        创建交叉注意力掩码
+        返回: [S_q, S_kv] 的布尔掩码张量
+        """
+        seq_len_q = len(seq_ids)
+        seq_len_kv = len(text_seq_ids)
+
+        # 创建索引网格
+        q_idx = torch.arange(seq_len_q, device=device).unsqueeze(1)
+        kv_idx = torch.arange(seq_len_kv, device=device).unsqueeze(0)
+
+        # 掩码逻辑: seq_ids[q_idx] == text_seq_ids[kv_idx] 且都 >= 0
+        mask = (seq_ids[q_idx] == text_seq_ids[kv_idx]) & \
+               (seq_ids[q_idx] >= 0) & \
+               (text_seq_ids[kv_idx] >= 0)
+
+        # 扩展到 [1, 1, S_q, S_kv] 以匹配 [B, N, S_q, D] @ [B, N, S_kv, D]
+        # SDPA期望的掩码格式是 [S_q, S_kv] 或 [B, N, S_q, S_kv]
+        mask = mask.unsqueeze(0).unsqueeze(0).bool()
+        # 将True转换为1.0, False转换为-inf (或使用additive mask)
+        mask = mask.masked_fill(mask == 0, False) # float('-inf')
+        mask = mask.masked_fill(mask == 1, True) # 0.0
+
+        return mask
+
+    @staticmethod
+    @torch.no_grad()
+    def _create_attention_mask(seq_ids, frame_ids, noise_ids, window_size, device):
+        """
+        创建自注意力掩码
+        返回: [S_q, S_kv] 的掩码张量
+        """
+        seq_len = len(seq_ids)
+
+        # 创建索引网格
+        q_idx = torch.arange(seq_len, device=device).unsqueeze(1)
+        kv_idx = torch.arange(seq_len, device=device).unsqueeze(0)
+
+        # 1. 序列掩码: 相同序列ID且都 >= 0
+        seq_mask = (seq_ids[q_idx] == seq_ids[kv_idx]) & \
+                   (seq_ids[q_idx] >= 0) & \
+                   (seq_ids[kv_idx] >= 0)
+
+        # 2. 帧级因果掩码: kv帧 <= q帧
+        block_causal_mask = frame_ids[kv_idx] <= frame_ids[q_idx]
+
+        # 3. 排除自身的因果掩码: kv帧 < q帧
+        block_causal_mask_exclude_self = frame_ids[kv_idx] < frame_ids[q_idx]
+
+        # 4. 自身帧掩码: kv帧 == q帧
+        block_self_mask = frame_ids[kv_idx] == frame_ids[q_idx]
+
+        # 5. clean到clean掩码
+        clean2clean_mask = (noise_ids[q_idx] == 1) & (noise_ids[kv_idx] == 1)
+
+        # 6. noise到clean掩码
+        noise2clean_mask = (noise_ids[q_idx] == 0) & (noise_ids[kv_idx] == 1)
+
+        # 7. noise到noise掩码
+        noise2noise_mask = (noise_ids[q_idx] == 0) & (noise_ids[kv_idx] == 0)
+
+        # 8. 窗口掩码: 帧ID差异 <= window_size
+        block_window_mask = (frame_ids[q_idx] - frame_ids[kv_idx]).abs() <= window_size
+
+        # 组合掩码逻辑
+        # mask_list = [
+        #     clean2clean AND block_causal,
+        #     noise2clean AND block_causal_exclude_self,
+        #     noise2noise AND block_self
+        # ]
+        mask1 = clean2clean_mask & block_causal_mask
+        mask2 = noise2clean_mask & block_causal_mask_exclude_self
+        mask3 = noise2noise_mask & block_self_mask
+
+        # OR组合三个条件
+        combined_mask = mask1 | mask2 | mask3
+
+        # AND序列掩码和窗口掩码
+        final_mask = combined_mask & seq_mask & block_window_mask
+
+        # 转换为SDPA期望的格式: [1, 1, S, S]
+        # 布尔掩码: True表示参与注意力, False表示屏蔽
+        # SDPA使用additive mask: 0表示参与, -inf表示屏蔽
+        mask = final_mask.unsqueeze(0).unsqueeze(0).bool()
+        mask = mask.masked_fill(mask == 0, False) # float('-inf')
+        mask = mask.masked_fill(mask == 1, True) # 0.0
+        return mask
+
 
 class FlexAttnFunc(nn.Module):
     flex_attn: ClassVar[Callable] = torch.compile(
@@ -302,7 +514,13 @@ class WanAttention(torch.nn.Module):
         if attn_mode == 'torch':
             self.attn_op = custom_sdpa
         elif attn_mode == 'flashattn':
+            try:
+                from flash_attn_interface import flash_attn_func
+            except:
+                from flash_attn import flash_attn_func
             self.attn_op = flash_attn_func
+        elif attn_mode == 'torch_flex':
+            self.attn_op = SDPAAttnFunc(cross_attention_dim_head is not None)
         elif attn_mode == 'flex':
             self.attn_op = FlexAttnFunc(cross_attention_dim_head is not None)
         else:
@@ -417,6 +635,8 @@ class WanAttention(torch.nn.Module):
         k,
         v,
         rotary_emb,
+        attention_mask,
+        cross_attention_mask,
         update_cache=0,
         cache_name='pos',
     ):
@@ -452,7 +672,7 @@ class WanAttention(torch.nn.Module):
             key = key_pool[:, valid]
             value = value_pool[:, valid]
 
-        hidden_states = self.attn_op(query, key, value)
+        hidden_states = self.attn_op(query, key, value, attention_mask=attention_mask, cross_attention_mask=cross_attention_mask)
 
         if update_cache == 0:
             if kv_cache is not None and kv_cache['k'] is not None:
@@ -512,49 +732,49 @@ class WanTransformerBlock(nn.Module):
         self.scale_shift_table = nn.Parameter(
             torch.randn(1, 6, dim) / dim**0.5)
 
-    def forward(
+    def compute_adaln_modulation(
         self,
-        hidden_states,
-        encoder_hidden_states,
         temb,
-        rotary_emb,
-        update_cache=0,
-        cache_name='pos',
-    ) -> torch.Tensor:
+    ):
         temb_scale_shift_table = self.scale_shift_table[None] + temb.float()
-        shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = \
-            rearrange(temb_scale_shift_table, 'b l n c -> b n l c').chunk(6, dim=1)
+        shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
+            rearrange(temb_scale_shift_table, "b l n c -> b n l c").chunk(6, dim=1)
+        )
         shift_msa = shift_msa.squeeze(1)
         scale_msa = scale_msa.squeeze(1)
         gate_msa = gate_msa.squeeze(1)
         c_shift_msa = c_shift_msa.squeeze(1)
         c_scale_msa = c_scale_msa.squeeze(1)
         c_gate_msa = c_gate_msa.squeeze(1)
-        # 1. Self-attention
-        norm_hidden_states = (self.norm1(hidden_states.float()) *
-                              (1. + scale_msa) +
-                              shift_msa).type_as(hidden_states)
-        attn_output = self.attn1(norm_hidden_states,
-                                 norm_hidden_states,
-                                 norm_hidden_states,
-                                 rotary_emb,
-                                 update_cache=update_cache,
-                                 cache_name=cache_name)
-        hidden_states = (hidden_states.float() +
-                         attn_output * gate_msa).type_as(hidden_states)
 
-        # 2. Cross-attention
+        return shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa
+
+    def compute_cross_attn_and_ffn(
+        self,
+        hidden_states,
+        encoder_hidden_states,
+        c_shift_msa,
+        c_scale_msa,
+        c_gate_msa,
+        attention_mask=None,
+        cross_attention_mask=None,
+        update_cache=0,
+        cache_name="pos",
+    ):
+        # Cross-attention
         norm_hidden_states = self.norm2(
             hidden_states.float()).type_as(hidden_states)
         attn_output = self.attn2(norm_hidden_states,
                                  encoder_hidden_states,
                                  encoder_hidden_states,
                                  None,
+                                 attention_mask,
+                                 cross_attention_mask,
                                  update_cache=0,
                                  cache_name=cache_name)
         hidden_states = hidden_states + attn_output
 
-        # 3. Feed-forward
+        # Feed-forward
         norm_hidden_states = (self.norm3(hidden_states.float()) *
                               (1. + c_scale_msa) +
                               c_shift_msa).type_as(hidden_states)
@@ -563,6 +783,47 @@ class WanTransformerBlock(nn.Module):
 
         hidden_states = (hidden_states.float() +
                          ff_output.float() * c_gate_msa).type_as(hidden_states)
+
+        return hidden_states
+
+    def forward(
+        self,
+        hidden_states,
+        encoder_hidden_states,
+        temb,
+        rotary_emb,
+        attention_mask=None,
+        cross_attention_mask=None,
+        update_cache=0,
+        cache_name='pos',
+    ) -> torch.Tensor:
+        shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = self.compute_adaln_modulation(temb)
+
+        # 1. Self-attention
+        norm_hidden_states = (self.norm1(hidden_states.float()) *
+                              (1. + scale_msa) +
+                              shift_msa).type_as(hidden_states)
+        attn_output = self.attn1(norm_hidden_states,
+                                 norm_hidden_states,
+                                 norm_hidden_states,
+                                 rotary_emb,
+                                 attention_mask,
+                                 cross_attention_mask,
+                                 update_cache=update_cache,
+                                 cache_name=cache_name)
+        hidden_states = (hidden_states.float() +
+                         attn_output * gate_msa).type_as(hidden_states)
+
+        # 2. Cross-attention and FFN
+        hidden_states = self.compute_cross_attn_and_ffn(hidden_states,
+                                                        encoder_hidden_states,
+                                                        c_shift_msa,
+                                                        c_scale_msa,
+                                                        c_gate_msa,
+                                                        attention_mask,
+                                                        cross_attention_mask,
+                                                        update_cache=0,
+                                                        cache_name=cache_name)
         return hidden_states
 
 
@@ -762,21 +1023,24 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                       condition_action_hidden_states.shape[1],
                       padded_length]
 
-        FlexAttnFunc.init_mask(latent_dict['noisy_latents'].shape, 
+        attn_mask, cross_attn_mask = SDPAAttnFunc.init_mask(
+                               latent_dict['noisy_latents'].shape, 
                                action_dict['noisy_latents'].shape, 
                                padded_length, 
                                input_dict["chunk_size"],
                                window_size=input_dict['window_size'],
                                patch_size=self.patch_size,
-                               device=hidden_states.device
-                               )
+                               device=hidden_states.device,
+                               dtype=hidden_states.dtype)
 
         for block in self.blocks:
             hidden_states = block(hidden_states,
-                                         text_hidden_states,
-                                         timestep_proj,
-                                         rotary_emb,
-                                         update_cache=False)
+                                  text_hidden_states,
+                                  timestep_proj,
+                                  rotary_emb,
+                                  attention_mask=attn_mask,
+                                  cross_attention_mask=cross_attn_mask,
+                                  update_cache=False)
         temb_scale_shift_table = self.scale_shift_table[None] + temb[:, :, None, ...]
         shift, scale = rearrange(temb_scale_shift_table,
                                  'b l n c -> b n l c').chunk(2, dim=1)

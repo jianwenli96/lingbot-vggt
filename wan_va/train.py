@@ -3,11 +3,18 @@ import argparse
 import os
 import sys
 from pathlib import Path
-import wandb
+from torch.utils.tensorboard.writer import SummaryWriter
 
 import torch
+try:
+    import torch_npu
+    from torch_npu.contrib import transfer_to_npu
+except Exception as e:
+    pass
+
 import torch.distributed as dist
 import torch.nn.functional as F
+from datetime import datetime
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 from torch.distributed.checkpoint.state_dict import (
@@ -20,6 +27,7 @@ from safetensors.torch import save_file, load_file
 import json
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from configs import VA_CONFIGS
 from distributed.fsdp import shard_model, apply_ac
@@ -50,18 +58,8 @@ import gc
 class Trainer:
     def __init__(self, config):
         if config.enable_wandb and config.rank == 0:
-            wandb.login(host=os.environ['WANDB_BASE_URL'], key=os.environ['WANDB_API_KEY'])
-            self.wandb = wandb
-            self.wandb.init(
-                entity=os.environ["WANDB_TEAM_NAME"],
-                project=os.getenv("WANDB_PROJECT", "va_robotwin"),
-                # dir=log_dir,
-                config=config,
-                mode="online",
-                name='test_lln'
-                # name=os.path.basename(os.path.normpath(job_config.job.dump_folder))
-            )
-            logger.info("WandB logging enabled")
+            self.writer = SummaryWriter(log_dir=config.save_root)
+            logger.info(f"TensorBoard logging enabled at {config.save_root}")
         self.step = 0
         self.config = config
         self.device = torch.device(f"cuda:{config.local_rank}")
@@ -85,7 +83,7 @@ class Trainer:
             transformer_path,
             torch_dtype=torch.float32,
             torch_device='cpu',
-            attn_mode="flex"
+            attn_mode="torch_flex"
         )
 
         logger.info("Setting up activation checkpointing ...")
@@ -480,15 +478,13 @@ class Trainer:
                         'lr': f'{lr:.2e}'
                     })
                     if self.config.enable_wandb:
-                        self.wandb.log({
-                            'loss_metrics/global_avg_video_loss': latent_loss_show,
-                            'loss_metrics/global_avg_action_loss': action_loss_show,
-                            'loss_metrics/global_max_video_loss': max_latent_loss_show,
-                            'loss_metrics/global_max_action_loss': max_action_loss_show,
-                            'grad_norm': total_norm.item(),
-                            'lr': lr,
-                        }, step=self.step)
-                
+                        self.writer.add_scalar('loss/global_avg_video_loss', latent_loss_show, self.step)
+                        self.writer.add_scalar('loss/global_avg_action_loss', action_loss_show, self.step)
+                        self.writer.add_scalar('loss/global_max_video_loss', max_latent_loss_show, self.step)
+                        self.writer.add_scalar('loss/global_max_action_loss', max_action_loss_show, self.step)
+                        self.writer.add_scalar('train/grad_norm', total_norm.item(), self.step)
+                        self.writer.add_scalar('train/lr', lr, self.step)
+
                 self.step += 1
                 
                 if self.step % self.config.save_interval == 0:
@@ -500,6 +496,9 @@ class Trainer:
                 dist.barrier()
 
         progress_bar.close()
+        if self.config.rank == 0 and self.config.enable_wandb:
+            self.writer.flush()
+            self.writer.close()
         logger.info("Training completed!")
 
 
@@ -519,6 +518,10 @@ def run(args):
 
     if args.save_root is not None:
         config.save_root = args.save_root
+
+    timestep = os.environ.get("LOG_TIME", datetime.now().strftime("%Y%m%d-%H%M%S"))
+    config.save_root = os.path.join(config.save_root, timestep)
+    os.makedirs(config.save_root, exist_ok=True)
 
     if rank == 0:
         logger.info(f"Using config: {args.config_name}")

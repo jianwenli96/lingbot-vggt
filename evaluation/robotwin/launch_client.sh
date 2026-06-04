@@ -19,7 +19,11 @@ task_config=demo_clean
 train_config_name=0
 model_name=0
 seed=0
-PORT=29056
+HOST=${3:-"127.0.0.1"}
+PORT=${4:-29056}
+GPU_ID=${5:-0}
+
+export CUDA_VISIBLE_DEVICES=${GPU_ID}
 
 PYTHONWARNINGS=ignore::UserWarning \
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 python -m evaluation.robotwin.eval_polict_client_openpi --config policy/$policy_name/deploy_policy.yml \
@@ -35,6 +39,7 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 python -m evaluation.robotwin.eval_polict_cli
     --video_guidance_scale 5 \
     --action_guidance_scale 1 \
     --test_num 100 \
+    --host ${HOST} \
     --port ${PORT}
 
 

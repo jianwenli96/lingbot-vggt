@@ -148,6 +148,12 @@ class LatentLeRobotDataset(LeRobotDataset):
         self.used_video_keys = config.obs_cam_keys
         self.q01 = np.array(config.norm_stat['q01'], dtype='float')[None]
         self.q99 = np.array(config.norm_stat['q99'], dtype='float')[None]
+
+        # Argument
+        self.random_frame_cut = config.random_frame_cut
+        self.min_frames = config.min_frames
+        self.max_frames = config.max_frames
+
         self._hf_torch_view = self.hf_dataset.with_format(
                 type='torch',
                 columns=['action'],
@@ -306,6 +312,19 @@ class LatentLeRobotDataset(LeRobotDataset):
         out_dict['actions'], out_dict['actions_mask'] = self._action_post_process(local_start_frame, local_end_frame, latent_frame_ids, ori_data_dict['action'])
 
         out_dict['latents'] = out_dict['latents'].permute(3, 0, 1, 2)
+
+        if self.random_frame_cut and ori_data_dict['observation.images.cam_high.latent_num_frames'] > self.max_frames: 
+            self.random_crop_n_dim(out_dict)
+        return out_dict
+
+    def random_crop_n_dim(self, out_dict):
+        _, n_total, *_ = out_dict["latents"].shape
+        seq_length = torch.randint(self.min_frames, self.max_frames, (1,)).item()
+        max_start = n_total - seq_length
+        start = torch.randint(0, max_start + 1, (1,)).item()
+        for key in ["latents", "actions", "actions_mask"]:
+            # 3. 执行切片
+            out_dict[key] = out_dict[key][:, start:start + seq_length, ...]
         return out_dict
 
     def __len__(self):

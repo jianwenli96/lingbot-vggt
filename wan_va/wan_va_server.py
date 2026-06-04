@@ -10,12 +10,19 @@ from diffusers.utils import export_to_video
 
 import numpy as np
 import torch
+try:
+    import torch_npu
+    from torch_npu.contrib import transfer_to_npu
+except Exception as e:
+    pass
+
 import torch.nn.functional as F
 from diffusers.pipelines.wan.pipeline_wan import prompt_clean
 from einops import rearrange
 from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from configs import VA_CONFIGS
 from distributed.fsdp import shard_model
@@ -77,9 +84,12 @@ class VA_Server:
             torch_device='cpu' if self.enable_offload else self.device,
         )
 
+        transformer_load_path = job_config.transformer_path if hasattr(job_config, 'transformer_path') \
+            and os.path.exists(job_config.transformer_path) else job_config.wan22_pretrained_model_name_or_path
+        transformer_load_path = os.path.join(transformer_load_path, 'transformer')
+        logger.info(f"Loading transformer from {transformer_load_path} ...")
         self.transformer = load_transformer(
-            os.path.join(job_config.wan22_pretrained_model_name_or_path,
-                         'transformer'),
+            transformer_load_path,
             torch_dtype=self.dtype,
             torch_device=self.device,
             attn_mode="torch"

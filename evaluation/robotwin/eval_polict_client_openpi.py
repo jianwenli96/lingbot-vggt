@@ -396,8 +396,8 @@ def main(usr_args):
     suc_nums = []
     test_num = usr_args["test_num"]
 
-    
-    model = WebsocketClientPolicy(port=usr_args['port'])
+    host = usr_args.get("host", "127.0.0.1")
+    model = WebsocketClientPolicy(host=host, port=usr_args['port'])
 
     st_seed, suc_num = eval_policy(task_name,
                                    TASK_ENV,
@@ -693,6 +693,8 @@ def parse_args_and_config():
 
 
 if __name__ == "__main__":
+    import logging
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     
     Sapien_TEST()
     usr_args = parse_args_and_config()
