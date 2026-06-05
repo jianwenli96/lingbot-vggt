@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from vggt_omega.models.layers import SelfAttentionBlock
+from ..layers import SelfAttentionBlock
 
 
 class CameraHead(nn.Module):

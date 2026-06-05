@@ -9,8 +9,8 @@ import warnings
 import torch
 import torch.nn as nn
 
-from vggt_omega.models.aggregator import Aggregator
-from vggt_omega.models.heads import CameraHead, DenseHead, TextAlignmentHead
+from .aggregator import Aggregator
+from .heads import CameraHead, DenseHead, TextAlignmentHead
 
 
 class VGGTOmega(nn.Module):

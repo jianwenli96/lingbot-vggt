@@ -8,18 +8,23 @@ import warnings
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms as TF
 
 
-def load_and_preprocess_images(image_path_list, mode="balanced", image_resolution=512, patch_size=16):
+def load_and_preprocess_images(image_list, mode="balanced", image_resolution=512, patch_size=16):
     """Load images for VGGT-Omega inference.
 
     `balanced` keeps the total token count close to image_resolution**2.
     `max_size` resizes the longest side to image_resolution.
     Both modes first center-crop extreme aspect ratios into [0.5, 2.0].
+
+    Supports both:
+    - List of image paths (strings)
+    - Numpy array/torch tensor of shape [B, C, H, W] for vectorized processing
     """
-    if len(image_path_list) == 0:
+    if len(image_list) == 0:
         raise ValueError("At least 1 image is required")
     if mode not in ["balanced", "max_size"]:
         raise ValueError("Mode must be either 'balanced' or 'max_size'")
@@ -30,12 +35,24 @@ def load_and_preprocess_images(image_path_list, mode="balanced", image_resolutio
     if image_resolution % patch_size != 0:
         raise ValueError("image_resolution must be divisible by patch_size")
 
+    # Check if input is a batch tensor/array for vectorized processing
+    if isinstance(image_list, (np.ndarray, torch.Tensor)) and image_list.ndim == 4:
+        images = _preprocess_images_batch(image_list, mode, image_resolution, patch_size)
+    else:
+        images = _preprocess_images_list(image_list, mode, image_resolution, patch_size)
+
+    return images
+
+
+def _preprocess_images_list(image_list, mode, image_resolution, patch_size):
+    """Per-image preprocessing for list of image paths or numpy arrays."""
     images = []
     shapes = set()
     to_tensor = TF.ToTensor()
 
-    for image_path in image_path_list:
-        image = _crop_to_supported_aspect_ratio(_load_rgb_image(image_path))
+    for image_input in image_list:
+        image = _crop_to_supported_aspect_ratio(_load_rgb_image(image_input))
+
         width, height = image.size
         aspect_ratio = height / max(width, 1)
 
@@ -55,6 +72,62 @@ def load_and_preprocess_images(image_path_list, mode="balanced", image_resolutio
         images = _pad_images_to_common_size(images, shapes)
 
     return torch.stack(images)
+
+
+def _preprocess_images_batch(image_list, mode, image_resolution, patch_size):
+    """Vectorized preprocessing for batch tensor/array input [B, C, H, W]."""
+    # Convert to tensor if numpy array
+    if isinstance(image_list, np.ndarray):
+        images = torch.from_numpy(image_list).float()
+    else:
+        images = image_list.float()
+
+    # Ensure values are in [0, 1]
+    if images.min() < 0 or images.max() > 1:
+        warnings.warn("Image values outside [0, 1] range, clipping to [0, 1]", stacklevel=2)
+        images = images.clamp(0, 1)
+
+    # Get original dimensions before cropping
+    _, _, h, w = images.shape
+    min_aspect_ratio = 0.5
+    max_aspect_ratio = 2.0
+
+    # Compute aspect ratio and crop parameters for all images at once
+    aspect_ratio = h / max(w, 1)
+
+    # Center crop to supported aspect ratio
+    if aspect_ratio < min_aspect_ratio:
+        crop_width = min(w, max(1, int(round(h / min_aspect_ratio))))
+        left = max((w - crop_width) // 2, 0)
+        images = images[:, :, :, left:left + crop_width]
+    elif aspect_ratio > max_aspect_ratio:
+        crop_height = min(h, max(1, int(round(w * max_aspect_ratio))))
+        top = max((h - crop_height) // 2, 0)
+        images = images[:, :, top:top + crop_height, :]
+
+    # Get current dimensions after cropping
+    _, _, h, w = images.shape
+    aspect_ratio = h / max(w, 1)
+
+    # Compute target shape
+    if mode == "balanced":
+        target_h, target_w = _balanced_target_shape(aspect_ratio, image_resolution, patch_size)
+    else:
+        target_h, target_w = _max_size_target_shape(aspect_ratio, image_resolution, patch_size)
+
+    # Bicubic resize using torch
+    images = F.interpolate(
+        images,
+        size=(target_h, target_w),
+        mode="bicubic",
+        align_corners=False,
+        antialias=True
+    )
+
+    # Clamp to [0, 1] after bicubic interpolation (can produce out-of-range values)
+    images = images.clamp(0, 1)
+
+    return images
 
 
 def _load_rgb_image(image_path):
