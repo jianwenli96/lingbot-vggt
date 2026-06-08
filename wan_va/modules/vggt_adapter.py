@@ -17,7 +17,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 
 from utils.logging import logger, init_logger
 
-from visual_util import predictions_to_glb
+from modules.visual_util import predictions_to_glb
 from vggt_omega.models import VGGTOmega
 from vggt_omega.utils.load_fn import load_and_preprocess_images
 from vggt_omega.utils.pose_enc import encoding_to_camera
@@ -107,12 +107,14 @@ class VGGTAdapter(nn.Module):
         self,
         vggt: Optional[VGGTOmega] = None,
         default_image_size: Optional[list] = None,
-        latent_frame_mode: Optional[str] = None
+        latent_frame_mode: Optional[str] = None,
+        latent_dimension: int = 2048,
     ):
         super().__init__()
         self.vggt = vggt
         self.default_image_size = default_image_size
         self.latent_frame_mode = latent_frame_mode
+        self.norm = nn.LayerNorm(latent_dimension, eps=1e-5, elementwise_affine=False)
 
     @classmethod
     def from_pretrained(
@@ -145,7 +147,8 @@ class VGGTAdapter(nn.Module):
         return cls(
             vggt=vggt.to(device, torch_dtype),
             default_image_size=vggt_adapter_config["default_image_size"],
-            latent_frame_mode=vggt_adapter_config["latent_frame_mode"]
+            latent_frame_mode=vggt_adapter_config["latent_frame_mode"],
+            latent_dimension=vggt_adapter_config["latent_dimension"]
         )
 
     def process_images(
@@ -175,6 +178,7 @@ class VGGTAdapter(nn.Module):
     def encode(
         self,
         images: Optional[np.ndarray | torch.Tensor] = None,
+        post_norm: bool = True,
         return_dict: bool = True,
         device: str = "cuda",
         torch_dtype: torch.dtype = torch.bfloat16
@@ -202,6 +206,9 @@ class VGGTAdapter(nn.Module):
         if final_tokens is None:
             raise ValueError("Aggregator did not cache the final layer, which VGGTOmega needs.")
         latents = final_tokens[:, :, :patch_token_start].contiguous().to(torch_dtype) # [B, F, 17, 2048]
+
+        if post_norm:
+            latents = self.norm(latents.float()).to(torch_dtype)
 
         if not return_dict:
             return latents, images, aggregated_tokens_list, patch_token_start
@@ -283,6 +290,7 @@ class VGGTAdapter(nn.Module):
     def forward(
         self,
         images: Optional[np.ndarray | torch.Tensor] = None,
+        post_norm: bool = False,
         return_latents: bool = False,
         device: str = "cuda",
         torch_dtype: torch.dtype = torch.bfloat16
@@ -295,7 +303,7 @@ class VGGTAdapter(nn.Module):
             return_latent: Whether to include latent in output
         """
         # Encode
-        encode_output = self.encode(images, return_dict=True, device=device, torch_dtype=torch_dtype)
+        encode_output = self.encode(images, return_dict=True, post_norm=post_norm, device=device, torch_dtype=torch_dtype)
         # Decode
         decode_output = self.decode(encode_output["images"], encode_output["aggregated_tokens_list"],
                                     encode_output["patch_token_start"], device)
@@ -324,9 +332,10 @@ def main():
     parser.add_argument("--image_dir", type=str, default="/mi/data2T/lijianwen/Codes/lingbot-va/example/robotwin", help="Directory containing input images")
     parser.add_argument("--output_dir", type=str, default="./vggt_output", help="Output directory")
     parser.add_argument("--device", type=str, default="cuda", help="Device (cuda/cpu)")
-    parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "float16", "bfloat16"])
+    parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "float16", "bfloat16"])
     parser.add_argument("--default_image_size", type=int, nargs=2, default=[512, 512], help="Default image size [H, W]")
     parser.add_argument("--latent_frame_mode", type=str, default="concat", help="Default frame mode")
+    parser.add_argument("--latent_dimension", type=int, default=2048, help="Default frame dimension")
     args = parser.parse_args()
 
     # Determine dtype
@@ -336,7 +345,8 @@ def main():
     # Create config
     vggt_adapter_config = {
         "default_image_size": args.default_image_size,
-        "latent_frame_mode": args.latent_frame_mode
+        "latent_frame_mode": args.latent_frame_mode,
+        "latent_dimension": args.latent_dimension
     }
 
     # Load model
@@ -381,7 +391,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     with torch.no_grad():
-        forward_outputs = adapter(images, return_latents=True, device=args.device, torch_dtype=torch_dtype)
+        forward_outputs = adapter(images, return_latents=True, post_norm=False, device=args.device, torch_dtype=torch_dtype)
         print(f"Forward output keys: {list(forward_outputs.keys())}")
         print(f"  depth shape: {forward_outputs['depth'].shape}")
         print(f"  world_points_from_depth shape: {forward_outputs['world_points_from_depth'].shape}")

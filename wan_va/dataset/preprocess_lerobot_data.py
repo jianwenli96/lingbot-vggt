@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Processing script using Xi0 VAE and text encoder initialization logic.
+Processing script using Wan2.2 VAE and text encoder initialization logic.
 
 Supports:
 - Step 1: Generate action_config in episodes.jsonl
 - Step 2: Extract latents using Wan2.2 VAE
+- Step 3: (Optional) Extract latents using VGGT-Omega aggregator
 - Batch processing multiple datasets in a directory
 """
 
@@ -13,7 +14,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 
 import numpy as np
 import torch
@@ -22,11 +23,12 @@ import torch.nn.functional as F
 from einops import rearrange
 from tqdm import tqdm
 
-# Add Xi0 to path
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+# Add Wan2.2 to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# Import from Xi0 utils
-from wan_va.modules.utils import load_vae, load_text_encoder, load_tokenizer
+# Import from Wan2.2 utils
+from modules.utils import load_vae, load_text_encoder, load_tokenizer
+from modules.vggt_adapter import VGGTAdapter
 
 
 # ==================== Step 1: Generate action_config ====================
@@ -99,12 +101,12 @@ def extract_latents_from_video(
     action_text: str,
     text_encoder,
     tokenizer,
-    fps: int = 10,
+    fps: float = 12.5,
     height: int = 256,
-    width: int = 256,
+    width: int = 320,
     start_frame: int = 0,
-    end_frame: Optional[int] = None,
-    dtype=torch.bfloat16,
+    end_frame: int = None,
+    dtype: torch.dtype = torch.bfloat16,
     device: str = "npu",
 ):
     """Extract latent features from video using Xi0 VAE (AutoencoderKLWan)."""
@@ -174,13 +176,17 @@ def extract_latents_from_video(
 
     # Resize spatial dimensions (height and width) for each frame
     frames = frames.squeeze(0).permute(1, 0, 2, 3)  # (F, C, H, W)
+    ori_frames = frames.clone()  # Keep original frames for VGGT-Omega
     frames = F.interpolate(frames, size=(height, width), mode='bilinear', align_corners=False)
     # Reshape back to (1, C, F, H, W)
     frames = frames.permute(1, 0, 2, 3).unsqueeze(0)
+    ori_frames = ori_frames.permute(1, 0, 2, 3).unsqueeze(0)  # (1, C, F, H, W)
 
     # Normalize to [-1, 1]
     frames = frames / 255.0 * 2.0 - 1.0
     frames = frames.to(device).to(dtype)
+    ori_frames = ori_frames / 255.0 * 2.0 - 1.0
+    ori_frames = ori_frames.to(device).to(dtype)
 
     # Encode with VAE (AutoencoderKLWan)
     with torch.no_grad():
@@ -244,6 +250,117 @@ def extract_latents_from_video(
         'ori_fps': int(ori_fps),
     }
 
+    return output, ori_frames
+
+
+def extract_vggt_latents_from_video(
+    vggt_adapter,
+    video_multiview_frames: list,
+    video_multiview_latents: list,
+    view_keys: Optional[List[str]] = None,
+    start_frame: Optional[int] = None,
+    end_frame: Optional[int] = None,
+    dtype: torch.dtype = torch.bfloat16,
+    device: str = "npu"
+):
+    """Extract latent features from video using VGGT-Omega aggregator."""
+    if vggt_adapter is None:
+        raise ValueError("vggt_adapter must not be None")
+    if not video_multiview_frames:
+        raise ValueError("video_multiview_frames must contain at least one view")
+    if len(video_multiview_frames) != len(video_multiview_latents):
+        raise ValueError(
+            "video_multiview_frames and video_multiview_latents must have the same number of views "
+            f"(got {len(video_multiview_frames)} and {len(video_multiview_latents)})"
+        )
+    if view_keys is not None and len(view_keys) != len(video_multiview_frames):
+        raise ValueError(
+            "view_keys must have the same number of views as video_multiview_frames "
+            f"(got {len(view_keys)} and {len(video_multiview_frames)})"
+        )
+
+    expected_start_frame = start_frame
+    expected_end_frame = end_frame
+    view_frame_tensors = []
+
+    for view_idx, (frames, latent_data) in enumerate(zip(video_multiview_frames, video_multiview_latents)):
+        if frames is None:
+            raise ValueError(f"View {view_idx} has no frame tensor")
+        if not torch.is_tensor(frames):
+            frames = torch.as_tensor(frames)
+        if frames.ndim == 4:
+            frames = frames.unsqueeze(0)
+        if frames.ndim != 5:
+            raise ValueError(
+                f"View {view_idx} frames must have shape [1, C, F, H, W] or [C, F, H, W], "
+                f"got {tuple(frames.shape)}"
+            )
+        if frames.shape[0] != 1:
+            raise ValueError(f"View {view_idx} frames must have batch size 1, got {frames.shape[0]}")
+
+        latent_start_frame = latent_data.get("start_frame") if isinstance(latent_data, dict) else None
+        latent_end_frame = latent_data.get("end_frame") if isinstance(latent_data, dict) else None
+        video_num_frames = latent_data.get("video_num_frames") if isinstance(latent_data, dict) else None
+
+        if latent_start_frame is not None and expected_start_frame is not None and latent_start_frame != expected_start_frame:
+            raise ValueError(
+                f"View {view_idx} frame/latent start_frame mismatch: "
+                f"{expected_start_frame} != {latent_start_frame}"
+            )
+        if latent_end_frame is not None and expected_end_frame is not None and latent_end_frame != expected_end_frame:
+            raise ValueError(
+                f"View {view_idx} frame/latent end_frame mismatch: "
+                f"{expected_end_frame} != {latent_end_frame}"
+            )
+        if video_num_frames != frames.shape[2]:
+            raise ValueError(
+                f"View {view_idx} video frame number mismatch: "
+                f"{frames.shape[2]} != {video_num_frames}"
+            )
+
+        view_frame_tensors.append(frames[0].float())
+
+    num_video_frames = view_frame_tensors[0].shape[1]
+    for view_idx, frame_tensors in enumerate(view_frame_tensors):
+        if frame_tensors.shape[1] != num_video_frames:
+            raise ValueError(
+                f"View {view_idx} has {frame_tensors.shape[1]} frames, expected {num_video_frames}"
+            )
+
+    resized_view_frame_tensors = []
+    resized_target_size = (
+        max(int(frame_tensors.shape[2]) for frame_tensors in view_frame_tensors),
+        max(int(frame_tensors.shape[3]) for frame_tensors in view_frame_tensors),
+    )
+    for frame_tensors in view_frame_tensors:
+        # extract_latents_from_video returns [-1, 1]; VGGTAdapter expects [0, 1].
+        frame_tensors = ((frame_tensors + 1.0) * 0.5).clamp(0.0, 1.0)
+        frame_tensors = rearrange(frame_tensors, "c f h w -> f c h w")
+        frame_tensors = F.interpolate(frame_tensors, size=resized_target_size, mode="bilinear", align_corners=False)
+        resized_view_frame_tensors.append(frame_tensors)
+
+    # [B, C, 3, H, W], where each time step is one VGGT batch item.
+    vggt_images = torch.stack(resized_view_frame_tensors, dim=2).to(device=device, dtype=dtype)
+    encoded = vggt_adapter.encode(vggt_images,
+                                  post_norm=True,
+                                  return_dict=True,
+                                  device=vggt_images.device,
+                                  torch_dtype=dtype)
+
+    vggt_latents = encoded["latents"].detach().cpu().to(dtype)
+
+    output = {
+        "vggt_latents": rearrange(vggt_latents, "b i j c -> (b i j) c"),
+        'vggt_latent_num_frames': vggt_latents.shape[0],
+        'vggt_latent_height': vggt_latents.shape[1],
+        'vggt_latent_width': vggt_latents.shape[2],
+        "vggt_image_size": getattr(vggt_adapter, "default_image_size", None),
+        "vggt_latent_frame_mode": getattr(vggt_adapter, "latent_frame_mode", None),
+        "num_video_frames": num_video_frames,
+        "view_keys": view_keys,
+        "start_frame": start_frame,
+        "end_frame": end_frame,
+    }
     return output
 
 
@@ -286,18 +403,28 @@ def main():
     )
     parser.add_argument("--input-dir", type=str, help="Path to directory containing multiple datasets")
     parser.add_argument("--pretrained-model-path", type=str,
-                        default="/efs-gy1/ckpts/lingbot-va-base",
+                        default="/mi/data2T/Embodied-AI/ckpts/lingbot-va-base",
                         help="Path to pretrained model root directory (containing vae/, text_encoder/, tokenizer/)")
+    parser.add_argument("--vggt-pretrained-model-path", type=str,
+                        default="/mi/data2T/Embodied-AI/ckpts/VGGT-Omega/vggt_omega_1b_512.pt",
+                        help="Path to VGGT-Omega checkpoint (Required when --enable-vggt is set).")
     parser.add_argument("--fps", type=float, default=12.5, help="Target FPS")
     parser.add_argument("--height", type=int, default=256, help="Target height")
     parser.add_argument("--width", type=int, default=320, help="Target width")
     parser.add_argument("--env-type", type=str, default=None,
                         help="Environment type (e.g., 'robotwin_tshape'). If not specified, auto-detect from dataset.")
+    parser.add_argument("--vggt-image-size", type=int, nargs=2, default=[512, 512],
+                        help="VGGT-Omega default image size [height width]")
+    parser.add_argument("--vggt-latent-frame-mode", type=str, default="concat",
+                        help="VGGT-Omega latent frame mode (e.g., 'concat', 'every_first')")
+    parser.add_argument("--vggt-latent-dimension", type=int, default=2048,
+                        help="VGGT-Omega latent dimension")
     parser.add_argument("--video-keys", type=str, nargs='+', help="Video keys to process")
     parser.add_argument("--device", type=str, default="npu:0", help="Device to use")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="Data type")
     parser.add_argument("--skip-step1", action="store_true", help="Skip Step 1 (action_config generation)")
     parser.add_argument("--skip-step2", action="store_true", help="Skip Step 2 (latent extraction)")
+    parser.add_argument("--skip-step3", action="store_true", help="Skip Step 3 (VGGT-Omega latent extraction)")
 
     args = parser.parse_args()
 
@@ -317,6 +444,10 @@ def main():
         for subdir in sorted(input_dir.iterdir()):
             if subdir.is_dir() and (subdir / "meta" / "info.json").exists():
                 dataset_paths.append(subdir)
+
+        if len(dataset_paths) == 0:
+            if input_dir.is_dir() and (input_dir / "meta" / "info.json").exists():
+                dataset_paths.append(input_dir)
 
         print(f"Found {len(dataset_paths)} datasets in {input_dir}:")
         for p in dataset_paths:
@@ -345,11 +476,16 @@ def main():
     print(f"  Dtype: {args.dtype}")
     print(f"  Target resolution: {args.height}x{args.width} @ {args.fps} fps")
     print(f"  Pretrained model: {args.pretrained_model_path}")
-    print(f"  Steps: Step1={not args.skip_step1}, Step2={not args.skip_step2}")
+    print(f"  VGGT-Omega image size: {args.vggt_image_size[0]}x{args.vggt_image_size[1]}")
+    print(f"  VGGT-Omega latent frame mode: {args.vggt_latent_frame_mode}")
+    print(f"  VGGT-Omega latent dimension: {args.vggt_latent_dimension}")
+    print(f"  VGGT-Omega Pretrained model: {args.vggt_pretrained_model_path}")
+    print(f"  Steps: Step1={not args.skip_step1}, Step2={not args.skip_step2}, Step3={not args.skip_step3}")
     print(f"{'='*60}\n")
 
-    # Load models (only if Step 2 is enabled)
-    vae, text_encoder, tokenizer = None, None, None
+    # Load models (only if Step 2/Step 3 is enabled)
+    vae, text_encoder, tokenizer, vggt_adapter = None, None, None, None
+
     if not args.skip_step2:
         print("Loading models for Step 2...")
         print(f"  VAE: {vae_path}")
@@ -359,7 +495,23 @@ def main():
         vae = load_vae(str(vae_path), dtype, args.device)
         text_encoder = load_text_encoder(str(text_encoder_path), dtype, args.device)
         tokenizer = load_tokenizer(str(tokenizer_path))
-        print("  ✓ Models loaded\n")
+
+    if not args.skip_step3:
+        print("Loading VGGT-Omega adapter for Step 3...")
+        vggt_adapter_config = {
+            "default_image_size": args.vggt_image_size,
+            "latent_frame_mode": args.vggt_latent_frame_mode,
+            "latent_dimension": args.vggt_latent_dimension
+        }
+        vggt_adapter = VGGTAdapter.from_pretrained(
+            vggt_adapter_config=vggt_adapter_config,
+            vggt_pretrained_path=args.vggt_pretrained_model_path,
+            device=args.device,
+            torch_dtype=dtype,
+        )
+        vggt_adapter.eval()
+
+    print("  ✓ Models loaded\n")
 
     # Process each dataset
     for dataset_idx, dataset_path in enumerate(dataset_paths, 1):
@@ -369,12 +521,14 @@ def main():
 
         # Step 1: Generate action_config
         if not args.skip_step1:
-            print("Step 1: Generating action_config...")
+            print("\nStep 1: Generating action_config...")
             update_episodes_jsonl(dataset_path)
 
-        # Step 2: Extract latents
+        # Step 2 and Step 3: Extract latents
         if not args.skip_step2:
             print("\nStep 2: Extracting latents...")
+            if not args.skip_step3:
+                print("\nStep 3: Extracting VGGT-Omega latents...")
 
             # Auto-detect video keys
             video_keys = args.video_keys
@@ -415,55 +569,94 @@ def main():
             # Create latents directory
             latents_dir = dataset_path / "latents"
             latents_dir.mkdir(exist_ok=True)
+            if not args.skip_step3:
+                vggt_latents_dir = dataset_path / "vggt_latents"
+                vggt_latents_dir.mkdir(exist_ok=True)
 
             # Process episodes
             for episode in tqdm(episodes, desc=f"  Processing episodes"):
                 episode_index = episode['episode_index']
                 episode_chunk = episode.get('episode_chunk', 0)
-                length = episode['length']
                 action_configs = episode['action_config']
 
-                for video_key in video_keys:
-                    video_file = (
-                        dataset_path / "videos" / f"chunk-{episode_chunk:03d}" /
-                        video_key / f"episode_{episode_index:06d}.mp4"
-                    )
+                for acfg in action_configs:
+                    start_frame = acfg['start_frame']
+                    end_frame = acfg['end_frame']
+                    action_text = acfg['action_text']
 
-                    if not video_file.exists():
-                        continue
+                    if not args.skip_step3:
+                        video_multiview_frames = []
+                        video_multiview_latents = []
+                        video_multiview_keys = []
 
-                    latent_key_dir = latents_dir / f"chunk-{episode_chunk:03d}" / video_key
-                    latent_key_dir.mkdir(parents=True, exist_ok=True)
+                    # video latents
+                    for video_key in video_keys:
+                        video_file = (
+                            dataset_path / "videos" / f"chunk-{episode_chunk:03d}" /
+                            video_key / f"episode_{episode_index:06d}.mp4"
+                        )
 
-                    # Get target resolution for this video key
-                    target_height, target_width = get_target_resolution(
-                        video_key, args.height, args.width, env_type
-                    )
+                        if not video_file.exists():
+                            continue
 
-                    # Print resolution info for first episode
-                    if episode_index == 0 and action_configs and action_configs[0]['start_frame'] == 0:
-                        print(f"    {video_key}: target resolution {target_height}×{target_width}")
-
-                    for acfg in action_configs:
-                        start_frame = acfg['start_frame']
-                        end_frame = acfg['end_frame']
-                        action_text = acfg['action_text']
-
+                        latent_key_dir = latents_dir / f"chunk-{episode_chunk:03d}" / video_key
+                        latent_key_dir.mkdir(parents=True, exist_ok=True)
                         latent_file = latent_key_dir / f"episode_{episode_index:06d}_{start_frame}_{end_frame}.pth"
 
+                        # Get target resolution for this video key
+                        target_height, target_width = get_target_resolution(
+                            video_key, args.height, args.width, env_type
+                        )
+
+                        # Print resolution info for first episode
+                        if episode_index == 0 and action_configs and action_configs[0]['start_frame'] == 0:
+                            print(f"    {video_key}: target resolution {target_height}×{target_width}")
+
                         try:
-                            latent_data = extract_latents_from_video(
+                            latent_data, frames = extract_latents_from_video(
                                 vae, str(video_file), action_text, text_encoder, tokenizer,
                                 args.fps, target_height, target_width,  # Use computed resolution
                                 start_frame, end_frame, dtype, args.device
                             )
                             torch.save(latent_data, latent_file)
+                            if not args.skip_step3:
+                                video_multiview_frames.append(frames)
+                                video_multiview_latents.append(latent_data)
+                                video_multiview_keys.append(video_key)
                         except Exception as e:
-                            print(f"\n  Error processing {video_file}: {e}")
-                            import traceback
-                            traceback.print_exc()
+                            raise ValueError(f"\n  Error processing {video_file}: {e}")
+
+                    if not args.skip_step3:
+                        if len(video_multiview_keys) != len(video_keys):
+                            missing_keys = sorted(set(video_keys) - set(video_multiview_keys))
+                            print(
+                                f"\n  Skipping VGGT-Omega in episode {episode_index} "
+                                f"frames {start_frame}-{end_frame}: missing/failed views {missing_keys}"
+                            )
+                            continue
+
+                        # VGGT-Omega latents
+                        vggt_latent_key_dir = vggt_latents_dir / f"chunk-{episode_chunk:03d}"
+                        vggt_latent_key_dir.mkdir(parents=True, exist_ok=True)
+                        vggt_latent_file = (vggt_latent_key_dir / f"episode_{episode_index:06d}_{start_frame}_{end_frame}.pth")
+                        try:
+                            vggt_latent_data = extract_vggt_latents_from_video(
+                                vggt_adapter,
+                                video_multiview_frames,
+                                video_multiview_latents,
+                                view_keys=video_multiview_keys,
+                                start_frame=start_frame,
+                                end_frame=end_frame,
+                                dtype=dtype,
+                                device=args.device,
+                            )
+                            torch.save(vggt_latent_data, vggt_latent_file)
+                        except Exception as e:
+                            raise ValueError(f"\n  Error processing VGGT-Omega in episode {episode_index}: {e}")
 
             print(f"  ✓ Latents saved to {latents_dir}")
+            if not args.skip_step3:
+                print(f"  ✓ VGGT-Omega latents saved to {vggt_latents_dir}")
 
     print(f"\n{'='*60}")
     print(f"✓ All datasets processed successfully!")
