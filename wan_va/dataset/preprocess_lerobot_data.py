@@ -403,7 +403,7 @@ def main():
     )
     parser.add_argument("--input-dir", type=str, help="Path to directory containing multiple datasets")
     parser.add_argument("--pretrained-model-path", type=str,
-                        default="/mi/data2T/Embodied-AI/ckpts/lingbot-va-base",
+                        default="/mi/data2T/Embodied-AI/ckpts/lingbot-vggt-base",
                         help="Path to pretrained model root directory (containing vae/, text_encoder/, tokenizer/)")
     parser.add_argument("--vggt-pretrained-model-path", type=str,
                         default="/mi/data2T/Embodied-AI/ckpts/VGGT-Omega/vggt_omega_1b_512.pt",

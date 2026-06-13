@@ -6,7 +6,7 @@ from .shared_config import va_shared_cfg
 va_robotwin_cfg = EasyDict(__name__='Config: VA robotwin')
 va_robotwin_cfg.update(va_shared_cfg)
 
-va_robotwin_cfg.wan22_pretrained_model_name_or_path = "/path/to/pretrained/model"
+va_robotwin_cfg.wan22_pretrained_model_name_or_path = "/mi/data2T/Embodied-AI/ckpts/lingbot-vggt-base"
 
 va_robotwin_cfg.attn_window = 72
 va_robotwin_cfg.frame_chunk_size = 2
@@ -21,13 +21,16 @@ va_robotwin_cfg.obs_cam_keys = [
     'observation.images.cam_right_wrist'
 ]
 va_robotwin_cfg.guidance_scale = 5
+va_robotwin_cfg.vggt_guidance_scale = 5
 va_robotwin_cfg.action_guidance_scale = 1
 
 va_robotwin_cfg.num_inference_steps = 25
+va_robotwin_cfg.vggt_num_inference_steps = 25
 va_robotwin_cfg.video_exec_step = -1
 va_robotwin_cfg.action_num_inference_steps = 50
 
 va_robotwin_cfg.snr_shift = 5.0
+va_robotwin_cfg.vggt_snr_shift = 5.0
 va_robotwin_cfg.action_snr_shift = 1.0
 
 va_robotwin_cfg.used_action_channel_ids = list(range(0, 7)) + list(
@@ -52,3 +55,11 @@ va_robotwin_cfg.norm_stat = {
         1, 1
     ] + [0.] * 14 + [1.0, 1.0],
 }
+
+# VGGTOmega config. Keep these values aligned with the training config and
+va_robotwin_cfg.vggt_pretrained_model_name_or_path = "/mi/data2T/Embodied-AI/ckpts/VGGT-Omega/vggt_omega_1b_512.pt"
+va_robotwin_cfg.vggt_image_size = 512
+va_robotwin_cfg.vggt_latent_frame_mode = "concat"
+va_robotwin_cfg.vggt_latent_dimension = 2048
+va_robotwin_cfg.vggt_latent_height = 12
+va_robotwin_cfg.vggt_latent_width = 17

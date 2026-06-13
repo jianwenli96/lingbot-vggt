@@ -95,11 +95,13 @@ class SDPAAttnFunc(nn.Module):
     @torch.no_grad()
     def init_mask(
         latent_shape,
+        vggt_shape,
         action_shape,
         padded_length,
         chunk_size,
         window_size,
         patch_size,
+        vggt_patch_size,
         device,
         dtype,
     ):
@@ -108,24 +110,30 @@ class SDPAAttnFunc(nn.Module):
         将FlexAttention的掩码逻辑转换为标准的布尔或浮点掩码张量
         """
         B, _, L_F, L_H, L_W = latent_shape
+        _, _, V_F, V_H, V_W = vggt_shape
         _, _, A_F, A_H, A_W = action_shape
 
         # 构建序列ID
         latent_seq_id = torch.arange(B)[:, None, None, None].\
             expand(-1, L_F // patch_size[0], L_H // patch_size[1], L_W // patch_size[2]).flatten()
+        vggt_seq_id = torch.arange(B)[:, None, None, None].\
+            expand(-1, V_F // vggt_patch_size[0], V_H // vggt_patch_size[1], V_W // vggt_patch_size[2]).flatten()
         action_seq_id = torch.arange(B)[:, None, None, None].expand(-1, A_F, A_H, A_W).flatten()
-        seq_ids = torch.cat([latent_seq_id] * 2 + [action_seq_id] * 2)
+        seq_ids = torch.cat([latent_seq_id] * 2 + [vggt_seq_id] * 2 + [action_seq_id] * 2)
 
         # 构建帧ID
         latent_frame_id = torch.arange(L_F)[None, :, None, None].expand(B, -1, L_H // patch_size[1], L_W // patch_size[2])[None].flatten()
+        vggt_frame_id = torch.arange(V_F)[None, :, None, None].expand(B, -1, V_H // vggt_patch_size[1], V_W // vggt_patch_size[2])[None].flatten()
         action_frame_id = torch.arange(A_F)[None, :, None, None].expand(B, -1, A_H, A_W)[None].flatten()
-        frame_ids = torch.cat([latent_frame_id // chunk_size * 2] * 2 + [action_frame_id // chunk_size * 2 + 1] * 2)
+        frame_ids = torch.cat([latent_frame_id // chunk_size * 2] * 2 + [vggt_frame_id // chunk_size * 2] * 2 + [action_frame_id // chunk_size * 2 + 1] * 2)
 
         # 构建noise ID
         noise_ids = torch.cat(
             [
                 torch.zeros_like(latent_frame_id),
                 torch.ones_like(latent_frame_id),
+                torch.zeros_like(vggt_frame_id),
+                torch.ones_like(vggt_frame_id),
                 torch.zeros_like(action_frame_id),
                 torch.ones_like(action_frame_id),
             ]
@@ -306,30 +314,38 @@ class FlexAttnFunc(nn.Module):
     @torch.no_grad()
     def init_mask(
         latent_shape, 
+        vggt_shape,
         action_shape, 
         padded_length, 
         chunk_size,
         window_size,
         patch_size,
+        vggt_patch_size,
         device,
     ):
         torch._inductor.config.realize_opcount_threshold = 100
         B, _, L_F, L_H, L_W = latent_shape
+        _, _, V_F, V_H, V_W = vggt_shape
         _, _, A_F, A_H, A_W = action_shape
 
         latent_seq_id = torch.arange(B)[:, None, None, None].\
             expand(-1, L_F // patch_size[0], L_H // patch_size[1], L_W // patch_size[2]).flatten()
+        vggt_seq_id = torch.arange(B)[:, None, None, None].\
+            expand(-1, V_F // vggt_patch_size[0], V_H // vggt_patch_size[1], V_W // vggt_patch_size[2]).flatten()
         action_seq_id = torch.arange(B)[:, None, None, None].expand(-1, A_F, A_H, A_W).flatten()
-        seq_ids = torch.cat([latent_seq_id] * 2 + [action_seq_id] * 2)
+        seq_ids = torch.cat([latent_seq_id] * 2 + [vggt_seq_id] * 2 + [action_seq_id] * 2)
 
         latent_frame_id = torch.arange(L_F)[None, :, None, None].expand(B, -1, L_H // patch_size[1], L_W // patch_size[2])[None].flatten()
+        vggt_frame_id = torch.arange(V_F)[None, :, None, None].expand(B, -1, V_H // vggt_patch_size[1], V_W // vggt_patch_size[2])[None].flatten()
         action_frame_id = torch.arange(A_F)[None, :, None, None].expand(B, -1, A_H, A_W)[None].flatten()
-        frame_ids = torch.cat([latent_frame_id // chunk_size * 2] * 2 + [action_frame_id // chunk_size * 2 + 1] * 2)
+        frame_ids = torch.cat([latent_frame_id // chunk_size * 2] * 2 + [vggt_frame_id // chunk_size * 2] * 2 + [action_frame_id // chunk_size * 2 + 1] * 2)
 
         noise_ids = torch.cat(
             [
                 torch.zeros_like(latent_frame_id),
                 torch.ones_like(latent_frame_id),
+                torch.zeros_like(vggt_frame_id),
+                torch.ones_like(vggt_frame_id),
                 torch.zeros_like(action_frame_id),
                 torch.ones_like(action_frame_id),
             ]
@@ -835,6 +851,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
     _skip_layerwise_casting_patterns = [
                                         # "patch_embedding", 
                                         "patch_embedding_mlp",
+                                        "vggt_patch_embedding_mlp",
                                         "condition_embedder", 
                                         'condition_embedder_action',
                                         "norm"]
@@ -858,10 +875,13 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
     @register_to_config
     def __init__(self,
                  patch_size=[1, 2, 2],
+                 vggt_patch_size=[1, 1, 1],
                  num_attention_heads=24,
                  attention_head_dim=128,
                  in_channels=48,
                  out_channels=48,
+                 vggt_in_channels=2048,
+                 vggt_out_channels=2048,
                  action_dim=30,
                  text_dim=4096,
                  freq_dim=256,
@@ -877,6 +897,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         """
         super().__init__()
         self.patch_size = patch_size
+        self.vggt_patch_size = vggt_patch_size
         self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
         inner_dim = num_attention_heads * attention_head_dim
@@ -884,6 +905,9 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                       rope_max_seq_len)
         self.patch_embedding_mlp = nn.Linear(
             in_channels * patch_size[0] * patch_size[1] * patch_size[2],
+            inner_dim)
+        self.vggt_patch_embedding_mlp = nn.Linear(
+            vggt_in_channels * vggt_patch_size[0] * vggt_patch_size[1] * vggt_patch_size[2],
             inner_dim)
         self.action_embedder = nn.Linear(action_dim, inner_dim)
         self.condition_embedder = WanTimeTextImageEmbedding(
@@ -907,6 +931,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         self.norm_out = FP32LayerNorm(inner_dim, eps, elementwise_affine=False)
         self.proj_out = nn.Linear(inner_dim,
                                   out_channels * math.prod(patch_size))
+        self.vggt_proj_out = nn.Linear(inner_dim,
+                                       vggt_out_channels * math.prod(vggt_patch_size))
         self.action_proj_out = nn.Linear(inner_dim, action_dim)
         self.scale_shift_table = nn.Parameter(
             torch.randn(1, 2, inner_dim) / inner_dim**0.5)
@@ -920,9 +946,9 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             block.attn1.clear_pred_cache(cache_name)
 
     def create_empty_cache(self, cache_name, attn_window,
-                           latent_token_per_chunk, action_token_per_chunk,
+                           latent_token_per_chunk, vggt_token_per_chunk, action_token_per_chunk,
                            device, dtype, batch_size):
-        total_tolen = (attn_window // 2) * latent_token_per_chunk + (
+        total_tolen = (attn_window // 2) * latent_token_per_chunk + (attn_window // 2) * vggt_token_per_chunk + (
             attn_window // 2) * action_token_per_chunk
         for block in self.blocks:
             block.attn1.init_kv_cache(cache_name, total_tolen,
@@ -938,6 +964,14 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                 p2=self.patch_size[1],
                 p3=self.patch_size[2])
             hidden_states = self.patch_embedding_mlp(hidden_states)
+        elif input_type == 'vggt_latent':
+            hidden_states = rearrange(
+                latents,
+                'b c (f p1) (h p2) (w p3) -> b (f h w) (c p1 p2 p3)',
+                p1=self.vggt_patch_size[0],
+                p2=self.vggt_patch_size[1],
+                p3=self.vggt_patch_size[2])
+            hidden_states = self.vggt_patch_embedding_mlp(hidden_states)
         elif input_type == 'action':
             hidden_states = rearrange(latents, 'b c f h w -> b (f h w) c')
             hidden_states = self.action_embedder(hidden_states)
@@ -947,9 +981,13 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             raise ValueError(f"Unsupported input type: {input_type}")
         return hidden_states
 
-    def _time_embed(self, timesteps, H, W, dtype, action_mode=False):
-        pach_scale_h, pach_scale_w = (1, 1) if action_mode else (
-            self.patch_size[1], self.patch_size[2])
+    def _time_embed(self, timesteps, H, W, dtype, vggt_mode=False, action_mode=False):
+        if action_mode:
+            pach_scale_h, pach_scale_w = (1, 1)
+        elif vggt_mode:
+            pach_scale_h, pach_scale_w = (self.vggt_patch_size[1], self.vggt_patch_size[2])
+        else:
+            pach_scale_h, pach_scale_w = (self.patch_size[1], self.patch_size[2])
         latent_time_steps = torch.repeat_interleave(
             timesteps,
             (H // pach_scale_h) *
@@ -963,36 +1001,47 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
     def forward_train(self, input_dict):
         input_dict['latent_dict']['noisy_latents'] = input_dict['latent_dict']['noisy_latents'].to(torch.bfloat16)
         input_dict['latent_dict']['latent'] = input_dict['latent_dict']['latent'].to(torch.bfloat16)
+        input_dict['vggt_dict']['noisy_latents'] = input_dict['vggt_dict']['noisy_latents'].to(torch.bfloat16)
+        input_dict['vggt_dict']['latent'] = input_dict['vggt_dict']['latent'].to(torch.bfloat16)
         input_dict['action_dict']['noisy_latents'] = input_dict['action_dict']['noisy_latents'].to(torch.bfloat16)
         input_dict['action_dict']['latent'] = input_dict['action_dict']['latent'].to(torch.bfloat16)
 
         latent_dict = input_dict['latent_dict']
+        vggt_dict = input_dict['vggt_dict']
         action_dict = input_dict['action_dict']
         batch_size = latent_dict['noisy_latents'].shape[0]
 
         latent_hidden_states = self._input_embed(latent_dict['noisy_latents'], input_type='latent').flatten(0, 1)[None]
+        vggt_hidden_states = self._input_embed(vggt_dict['noisy_latents'], input_type='vggt_latent').flatten(0, 1)[None]
         action_hidden_states = self._input_embed(action_dict['noisy_latents'], input_type='action').flatten(0, 1)[None]
         text_hidden_states = self._input_embed(latent_dict["text_emb"], input_type='text')
 
         text_hidden_states = text_hidden_states.flatten(0, 1)[None]
 
         condition_latent_hidden_states = self._input_embed(latent_dict['latent'], input_type='latent').flatten(0, 1)[None]
+        condition_vggt_hidden_states = self._input_embed(vggt_dict['latent'], input_type='vggt_latent').flatten(0, 1)[None]
         condition_action_hidden_states = self._input_embed(action_dict['latent'], input_type='action').flatten(0, 1)[None]
 
         hidden_states = torch.cat([latent_hidden_states, 
                                    condition_latent_hidden_states,
+                                   vggt_hidden_states,
+                                   condition_vggt_hidden_states,
                                    action_hidden_states, 
                                    condition_action_hidden_states], dim=1)
 
 
         latent_grid_id = latent_dict['grid_id'].permute(1, 0, 2).flatten(1)[None]
+        vggt_grid_id = vggt_dict['grid_id'].permute(1, 0, 2).flatten(1)[None]
         action_grid_id = action_dict['grid_id'].permute(1, 0, 2).flatten(1)[None]
-        full_grid_id = torch.cat([latent_grid_id] * 2 + [action_grid_id] * 2, dim=2)
+        full_grid_id = torch.cat([latent_grid_id] * 2 + [vggt_grid_id] * 2 + [action_grid_id] * 2, dim=2)
 
         rotary_emb = self.rope(full_grid_id)[:, :, None] 
 
         latent_time_steps = torch.cat(
             [latent_dict['timesteps'].flatten(0, 1), latent_dict['cond_timesteps'].flatten(0, 1)]
+        )[None]
+        vggt_time_steps = torch.cat(
+            [vggt_dict['timesteps'].flatten(0, 1), vggt_dict['cond_timesteps'].flatten(0, 1)]
         )[None]
         action_time_steps = torch.cat(
             [action_dict['timesteps'].flatten(0, 1), action_dict['cond_timesteps'].flatten(0, 1)]
@@ -1002,13 +1051,19 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                         latent_dict['noisy_latents'].shape[-1], 
                         dtype=hidden_states.dtype, 
                         action_mode=False)
+        vggt_temb, vggt_timestep_proj = self._time_embed(vggt_time_steps,
+                        vggt_dict['noisy_latents'].shape[-2],
+                        vggt_dict['noisy_latents'].shape[-1],
+                        dtype=hidden_states.dtype,
+                        vggt_mode=True,
+                        action_mode=False)
         action_temb, action_timestep_proj = self._time_embed(action_time_steps,
                         action_dict['noisy_latents'].shape[-2], 
                         action_dict['noisy_latents'].shape[-1], 
                         dtype=hidden_states.dtype, 
                         action_mode=True)
-        temb = torch.cat([latent_temb, action_temb], dim=1)
-        timestep_proj = torch.cat([latent_timestep_proj, action_timestep_proj], dim=1)
+        temb = torch.cat([latent_temb, vggt_temb, action_temb], dim=1)
+        timestep_proj = torch.cat([latent_timestep_proj, vggt_timestep_proj, action_timestep_proj], dim=1)
 
         total_length = hidden_states.shape[1]
         padded_length = (128 - total_length % 128) % 128
@@ -1019,17 +1074,21 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
 
         split_list = [latent_hidden_states.shape[1], 
                       condition_latent_hidden_states.shape[1], 
+                      vggt_hidden_states.shape[1],
+                      condition_vggt_hidden_states.shape[1],
                       action_hidden_states.shape[1], 
                       condition_action_hidden_states.shape[1],
                       padded_length]
 
         attn_mask, cross_attn_mask = SDPAAttnFunc.init_mask(
                                latent_dict['noisy_latents'].shape, 
+                               vggt_dict['noisy_latents'].shape,
                                action_dict['noisy_latents'].shape, 
                                padded_length, 
                                input_dict["chunk_size"],
                                window_size=input_dict['window_size'],
                                patch_size=self.patch_size,
+                               vggt_patch_size=self.vggt_patch_size,
                                device=hidden_states.device,
                                dtype=hidden_states.dtype)
 
@@ -1049,21 +1108,89 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         hidden_states = (self.norm_out(hidden_states.float()) *
                                 (1. + scale) +
                                 shift).type_as(hidden_states)
-        latent_hidden_states, _, action_hidden_states, _, _ = torch.split(hidden_states, split_list, dim=1)
+        latent_hidden_states, _, vggt_hidden_states, _, action_hidden_states, _, _ = torch.split(hidden_states, split_list, dim=1)
         latent_hidden_states = self.proj_out(latent_hidden_states)
         latent_hidden_states = rearrange(latent_hidden_states,
                                              '1 (b l) (n c) -> b (l n) c',
                                              n=math.prod(self.patch_size), b=batch_size)  #
+        vggt_hidden_states = self.vggt_proj_out(vggt_hidden_states)
+        vggt_hidden_states = rearrange(vggt_hidden_states,
+                                             '1 (b l) (n c) -> b (l n) c',
+                                             n=math.prod(self.vggt_patch_size), b=batch_size)  #
         action_hidden_states = self.action_proj_out(action_hidden_states)
         action_hidden_states = rearrange(action_hidden_states,
                                              '1 (b l) c -> b l c',
                                              b=batch_size)  #
 
-        return latent_hidden_states, action_hidden_states
+        return latent_hidden_states, vggt_hidden_states, action_hidden_states
+
+    def _infer_joint(
+        self,
+        latent_dict,
+        vggt_dict,
+        update_cache=0,
+        cache_name="pos",
+    ):
+        latent_hidden_states = self._input_embed(latent_dict['noisy_latents'], input_type='latent')
+        vggt_hidden_states = self._input_embed(vggt_dict['noisy_latents'], input_type='vggt_latent')
+        split_list = [latent_hidden_states.shape[1], vggt_hidden_states.shape[1]]
+        hidden_states = torch.cat([latent_hidden_states, vggt_hidden_states], dim=1)
+
+        text_hidden_states = self.condition_embedder.text_embedder(latent_dict["text_emb"])
+        full_grid_id = torch.cat([latent_dict['grid_id'], vggt_dict['grid_id']], dim=2)
+        rotary_emb = self.rope(full_grid_id)[:, :, None]
+
+        latent_temb, latent_timestep_proj = self._time_embed(
+            latent_dict['timesteps'],
+            latent_dict['noisy_latents'].shape[-2],
+            latent_dict['noisy_latents'].shape[-1],
+            dtype=hidden_states.dtype,
+        )
+        vggt_temb, vggt_timestep_proj = self._time_embed(
+            vggt_dict['timesteps'],
+            vggt_dict['noisy_latents'].shape[-2],
+            vggt_dict['noisy_latents'].shape[-1],
+            dtype=hidden_states.dtype,
+            vggt_mode=True,
+        )
+        temb = torch.cat([latent_temb, vggt_temb], dim=1)
+        timestep_proj = torch.cat([latent_timestep_proj, vggt_timestep_proj], dim=1)
+
+        for block in self.blocks:
+            hidden_states = block(
+                hidden_states,
+                text_hidden_states,
+                timestep_proj,
+                rotary_emb,
+                update_cache=update_cache,
+                cache_name=cache_name,
+            )
+
+        temb_scale_shift_table = (self.scale_shift_table[None] + temb[:, :, None])
+        shift, scale = rearrange(temb_scale_shift_table, 'b l n c -> b n l c').chunk(2, dim=1)
+        hidden_states = (self.norm_out(hidden_states.float()) *
+            (1. + scale.squeeze(1).to(hidden_states.device)) +
+            shift.squeeze(1).to(hidden_states.device)).type_as(hidden_states)
+
+        latent_hidden_states, vggt_hidden_states = torch.split(hidden_states, split_list, dim=1)
+        latent_hidden_states = self.proj_out(latent_hidden_states)
+        latent_hidden_states = rearrange(
+            latent_hidden_states,
+            'b l (n c) -> b (l n) c',
+            n=math.prod(self.patch_size),
+        )
+        vggt_hidden_states = self.vggt_proj_out(vggt_hidden_states)
+        vggt_hidden_states = rearrange(
+            vggt_hidden_states,
+            'b l (n c) -> b (l n) c',
+            n=math.prod(self.vggt_patch_size),
+        )
+        return latent_hidden_states, vggt_hidden_states
 
     def forward(
         self,
         input_dict,
+        vggt_dict=None,
         update_cache=0,
         cache_name="pos",
         action_mode=False,
@@ -1090,6 +1217,13 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         """
         if train_mode:
             return self.forward_train(input_dict)
+        if vggt_dict is not None:
+            return self._infer_joint(
+                input_dict,
+                vggt_dict,
+                update_cache=update_cache,
+                cache_name=cache_name,
+            )
         if action_mode:  # action input emb
             latent_hidden_states = rearrange(input_dict['noisy_latents'],
                                              'b c f h w -> b (f h w) c')
@@ -1109,8 +1243,11 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
 
         latent_grid_id = input_dict['grid_id']
         rotary_emb = self.rope(latent_grid_id)[:, :, None]  # 1 L 1 C
-        pach_scale_h, pach_scale_w = (1, 1) if action_mode else (
-            self.patch_size[1], self.patch_size[2])
+
+        if action_mode:
+            pach_scale_h, pach_scale_w = (1, 1)
+        else:
+            pach_scale_h, pach_scale_w = (self.patch_size[1], self.patch_size[2])
 
         latent_time_steps = torch.repeat_interleave(
             input_dict['timesteps'],
@@ -1150,10 +1287,13 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
 
 if __name__ == '__main__':
     model = WanTransformer3DModel(patch_size=[1, 2, 2],
+                                  vggt_patch_size=[1, 1, 1],
                                   num_attention_heads=24,
                                   attention_head_dim=128,
                                   in_channels=48,
                                   out_channels=48,
+                                  vggt_in_channels=2048,
+                                  vggt_out_channels=2048,
                                   action_dim=30,
                                   text_dim=4096,
                                   freq_dim=256,

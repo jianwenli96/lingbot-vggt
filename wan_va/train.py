@@ -65,6 +65,7 @@ class Trainer:
         self.device = torch.device(f"cuda:{config.local_rank}")
         self.dtype = config.param_dtype
         self.patch_size = config.patch_size
+        self.vggt_patch_size = config.vggt_patch_size
 
         # Load models
         logger.info("Loading models...")
@@ -135,6 +136,8 @@ class Trainer:
 
         self.train_scheduler_latent = FlowMatchScheduler(shift=self.config.snr_shift, sigma_min=0.0, extra_one_step=True)
         self.train_scheduler_latent.set_timesteps(1000, training=True)
+        self.train_scheduler_vggt = FlowMatchScheduler(shift=self.config.vggt_snr_shift, sigma_min=0.0, extra_one_step=True)
+        self.train_scheduler_vggt.set_timesteps(1000, training=True)
         self.train_scheduler_action = FlowMatchScheduler(shift=self.config.action_snr_shift, sigma_min=0.0, extra_one_step=True)
         self.train_scheduler_action.set_timesteps(1000, training=True)
 
@@ -163,7 +166,7 @@ class Trainer:
         return batch
 
     @torch.no_grad()
-    def _add_noise(self, latent, train_scheduler, action_mask=False, action_mode=False, noisy_cond_prob=0.):
+    def _add_noise(self, latent, train_scheduler, vggt_mode=False, action_mask=False, action_mode=False, noisy_cond_prob=0.):
         B, C, F, H, W = latent.shape
 
         timestep_ids = sample_timestep_id(batch_size=F, num_train_timesteps=train_scheduler.num_train_timesteps)
@@ -172,10 +175,13 @@ class Trainer:
         noisy_latents =train_scheduler.add_noise(latent, noise, timesteps, t_dim=2)
         targets =train_scheduler.training_target(latent, noise, timesteps)
 
-        patch_f, patch_h, patch_w = self.patch_size
-        if action_mode:
+        if vggt_mode:
+            patch_f, patch_h, patch_w = self.vggt_patch_size
+        elif action_mode:
             patch_f = patch_h = patch_w = 1
-        
+        else:
+            patch_f, patch_h, patch_w = self.patch_size
+
         latent_grid_id = get_mesh_id(
             latent.shape[-3] // patch_f,  # F
             latent.shape[-2] // patch_h,  # H
@@ -225,7 +231,15 @@ class Trainer:
             action_mask=None, 
             action_mode=False,
             noisy_cond_prob=0.5)
-        
+
+        vggt_dict = self._add_noise(
+            latent=batch_dict['vggt_latents'],
+            train_scheduler=self.train_scheduler_vggt,
+            vggt_mode=True,
+            action_mask=None,
+            action_mode=False,
+            noisy_cond_prob=0.5)
+
         action_dict = self._add_noise(
             latent=batch_dict['actions'], 
             train_scheduler=self.train_scheduler_action, 
@@ -234,11 +248,13 @@ class Trainer:
             noisy_cond_prob=0.0)
 
         latent_dict['text_emb'] = batch_dict['text_emb']
+        vggt_dict['text_emb'] = batch_dict['text_emb']
         action_dict['text_emb'] = batch_dict['text_emb']
         action_dict['actions_mask'] = batch_dict['actions_mask']
 
         input_dict = {
             'latent_dict': latent_dict,
+            'vggt_dict': vggt_dict,
             'action_dict': action_dict,
             'chunk_size': torch.randint(1, 5, (1,)).item(),
             'window_size': torch.randint(4, 65, (1,)).item(),
@@ -255,14 +271,20 @@ class Trainer:
         input_dict,
         pred
     ):
-        latent_pred, action_pred = pred
+        latent_pred, vggt_pred, action_pred = pred
         action_pred = rearrange(action_pred, 'b (f n) c -> b c f n 1', f=input_dict['action_dict']['targets'].shape[-3])
         latent_pred = data_seq_to_patch(
                         self.patch_size, latent_pred,
                         input_dict['latent_dict']['targets'].shape[-3], input_dict['latent_dict']['targets'].shape[-2],
                         input_dict['latent_dict']['targets'].shape[-1], batch_size=latent_pred.shape[0])
+        vggt_pred = data_seq_to_patch(
+                        self.vggt_patch_size, vggt_pred,
+                        input_dict['vggt_dict']['targets'].shape[-3], input_dict['vggt_dict']['targets'].shape[-2],
+                        input_dict['vggt_dict']['targets'].shape[-1], batch_size=vggt_pred.shape[0])
+
         Bn, Fn = input_dict['latent_dict']['timesteps'].shape
         latent_loss_weight = self.train_scheduler_latent.training_weight(input_dict['latent_dict']['timesteps'].flatten()).reshape(Bn, Fn)
+        vggt_loss_weight = self.train_scheduler_vggt.training_weight(input_dict['vggt_dict']['timesteps'].flatten()).reshape(Bn, Fn)
         action_loss_weight = self.train_scheduler_action.training_weight(input_dict['action_dict']['timesteps'].flatten()).reshape(Bn, Fn)
 
         # Frame-wise video loss calculation
@@ -275,6 +297,17 @@ class Trainer:
         latent_loss_per_frame = latent_loss.sum(dim=1)  # (B*F,)
         latent_mask_per_frame = torch.ones_like(latent_loss).sum(dim=1)  # (B*F,)
         latent_loss = (latent_loss_per_frame / (latent_mask_per_frame + 1e-6)).mean()
+
+        # Frame-wise VGGT loss calculation
+        vggt_loss = F.mse_loss(vggt_pred.float(), input_dict['vggt_dict']['targets'].float().detach(), reduction='none')
+        vggt_loss = vggt_loss * vggt_loss_weight[:, None, :, None, None]
+        # Permute to (B, F, H, W, C) and flatten to (B*F, H*W*C)
+        vggt_loss = vggt_loss.permute(0, 2, 3, 4, 1)  # (B, C, F, H, W) -> (B, F, H, W, C)
+        vggt_loss = vggt_loss.flatten(0, 1).flatten(1)  # (B, F, H, W, C) -> (B*F, H*W*C)
+        # Sum per frame and compute mask per frame
+        vggt_loss_per_frame = vggt_loss.sum(dim=1)  # (B*F,)
+        vggt_mask_per_frame = torch.ones_like(vggt_loss).sum(dim=1)  # (B*F,)
+        vggt_loss = (vggt_loss_per_frame / (vggt_mask_per_frame + 1e-6)).mean()
 
         # Frame-wise action loss calculation
         action_loss = F.mse_loss(action_pred.float(), input_dict['action_dict']['targets'].float().detach(), reduction='none')
@@ -290,7 +323,7 @@ class Trainer:
         action_mask_per_frame = action_mask.sum(dim=1)  # (B*F,)
         action_loss = (action_loss_per_frame / (action_mask_per_frame + 1e-6)).mean()
 
-        return latent_loss / self.gradient_accumulation_steps, action_loss / self.gradient_accumulation_steps
+        return latent_loss / self.gradient_accumulation_steps, vggt_loss / self.gradient_accumulation_steps, action_loss / self.gradient_accumulation_steps
 
     def _train_step(self, batch, batch_idx):
         """Train a single batch, returns losses for logging."""
@@ -305,12 +338,12 @@ class Trainer:
             self.transformer.set_requires_gradient_sync(True)
 
         output = self.transformer(input_dict, train_mode=True)
-        latent_loss, action_loss = self.compute_loss(input_dict, output)
-        loss = latent_loss + action_loss
+        latent_loss, vggt_loss, action_loss = self.compute_loss(input_dict, output)
+        loss = latent_loss + vggt_loss + action_loss
 
         loss.backward()
 
-        losses = {'latent_loss': latent_loss.detach(), 'action_loss': action_loss.detach()}
+        losses = {'total_loss': loss.detach(), 'latent_loss': latent_loss.detach(), 'vggt_loss': vggt_loss.detach(), 'action_loss': action_loss.detach()}
         
         # Only update weights after accumulating gradients
         if should_sync:
@@ -432,7 +465,9 @@ class Trainer:
         )
 
         self.optimizer.zero_grad()
+        accumulated_total_losses = []
         accumulated_latent_losses = []
+        accumulated_vggt_losses = []
         accumulated_action_losses = []
         step_in_accumulation = 0
 
@@ -443,7 +478,9 @@ class Trainer:
             losses = self._train_step(batch, step_in_accumulation)
             
             # Accumulate losses for logging
+            accumulated_total_losses.append(losses['total_loss'])
             accumulated_latent_losses.append(losses['latent_loss'])
+            accumulated_vggt_losses.append(losses['vggt_loss'])
             accumulated_action_losses.append(losses['action_loss'])
             step_in_accumulation += 1
 
@@ -452,13 +489,19 @@ class Trainer:
                 lr = self.lr_scheduler.get_last_lr()[0]
 
                 # Average accumulated losses
+                total_loss_show = dist_mean(torch.stack(accumulated_total_losses).sum()).detach().cpu().item()
                 latent_loss_show = dist_mean(torch.stack(accumulated_latent_losses).sum()).detach().cpu().item()
+                vggt_loss_show = dist_mean(torch.stack(accumulated_vggt_losses).sum()).detach().cpu().item()
                 action_loss_show = dist_mean(torch.stack(accumulated_action_losses).sum()).detach().cpu().item()
+                max_total_loss_show = dist_max(torch.stack(accumulated_total_losses).sum()).detach().cpu().item()
                 max_latent_loss_show = dist_max(torch.stack(accumulated_latent_losses).sum()).detach().cpu().item()
+                max_vggt_loss_show = dist_max(torch.stack(accumulated_vggt_losses).sum()).detach().cpu().item()
                 max_action_loss_show = dist_max(torch.stack(accumulated_action_losses).sum()).detach().cpu().item()
 
                 # Clear accumulated losses
+                accumulated_total_losses = []
                 accumulated_latent_losses = []
+                accumulated_vggt_losses = []
                 accumulated_action_losses = []
                 step_in_accumulation = 0
 
@@ -471,16 +514,22 @@ class Trainer:
                     total_norm = losses['total_norm']
                     progress_bar.n += 1
                     progress_bar.set_postfix({
+                        'total_loss': f'{total_loss_show:.4f}',
                         'latent_loss': f'{latent_loss_show:.4f}',
+                        'vggt_loss': f'{vggt_loss_show:.4f}',
                         'action_loss': f'{action_loss_show:.4f}',
                         'step': self.step,
                         'grad_norm': f'{total_norm.item():.2f}',
                         'lr': f'{lr:.2e}'
                     })
                     if self.config.enable_wandb:
+                        self.writer.add_scalar('loss/global_avg_total_loss', total_loss_show, self.step)
                         self.writer.add_scalar('loss/global_avg_video_loss', latent_loss_show, self.step)
+                        self.writer.add_scalar('loss/global_avg_vggt_loss', vggt_loss_show, self.step)
                         self.writer.add_scalar('loss/global_avg_action_loss', action_loss_show, self.step)
+                        self.writer.add_scalar('loss/global_max_total_loss', max_total_loss_show, self.step)
                         self.writer.add_scalar('loss/global_max_video_loss', max_latent_loss_show, self.step)
+                        self.writer.add_scalar('loss/global_max_vggt_loss', max_vggt_loss_show, self.step)
                         self.writer.add_scalar('loss/global_max_action_loss', max_action_loss_show, self.step)
                         self.writer.add_scalar('train/grad_norm', total_norm.item(), self.step)
                         self.writer.add_scalar('train/lr', lr, self.step)
