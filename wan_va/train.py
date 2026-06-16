@@ -165,102 +165,6 @@ class Trainer:
         
         return batch
 
-    @torch.no_grad()
-    def _add_noise(self, latent, train_scheduler, vggt_mode=False, action_mask=False, action_mode=False, noisy_cond_prob=0.):
-        B, C, F, H, W = latent.shape
-
-        timestep_ids = sample_timestep_id(batch_size=F, num_train_timesteps=train_scheduler.num_train_timesteps)
-        noise = torch.zeros_like(latent).normal_()
-        timesteps = train_scheduler.timesteps[timestep_ids].to(device=self.device)
-        noisy_latents =train_scheduler.add_noise(latent, noise, timesteps, t_dim=2)
-        targets =train_scheduler.training_target(latent, noise, timesteps)
-
-        if vggt_mode:
-            patch_f, patch_h, patch_w = self.vggt_patch_size
-        elif action_mode:
-            patch_f = patch_h = patch_w = 1
-        else:
-            patch_f, patch_h, patch_w = self.patch_size
-
-        latent_grid_id = get_mesh_id(
-            latent.shape[-3] // patch_f,  # F
-            latent.shape[-2] // patch_h,  # H
-            latent.shape[-1] // patch_w,  # W
-            t=1 if action_mode else 0,  # 1 for action mode (0 for latent), not used
-            f_w=1,
-            f_shift=0,
-            action=action_mode
-        ).to(self.device)  # shape: [4, seq_len]
-        latent_grid_id = latent_grid_id[None].repeat(B, 1, 1)
-
-        if torch.rand(1).item() < noisy_cond_prob:
-            cond_timestep_ids = sample_timestep_id(
-                    batch_size=F,
-                    min_timestep_bd=0.5, 
-                    max_timestep_bd=1.0, 
-                    num_train_timesteps=train_scheduler.num_train_timesteps,
-                )
-            noise = torch.zeros_like(latent).normal_()
-            cond_timesteps = train_scheduler.timesteps[cond_timestep_ids].to(device=self.device)
-            latent = train_scheduler.add_noise(latent, noise, cond_timesteps, t_dim=2)
-        else:
-            cond_timesteps = torch.zeros_like(timesteps)
-
-        if action_mask is not None:
-            noisy_latents *= action_mask.float()
-            targets *= action_mask.float()
-            latent *= action_mask.float()
-
-        return dict(
-            timesteps=timesteps[None].repeat(B, 1),
-            noisy_latents=noisy_latents,
-            targets=targets,
-            latent=latent,
-            cond_timesteps=cond_timesteps[None].repeat(B, 1),
-            grid_id=latent_grid_id,
-        )
-
-    @torch.no_grad()
-    def _prepare_input_dict(self, batch_dict):
-        """Prepare input dict following infer code pattern from wan_va_server.py."""
-        # Generate grid_id following infer code (no batch dimension yet)
-        # For action mode: get_mesh_id(shape[-3], shape[-2], shape[-1], t=1, f_w=1, f_shift, action=True)
-        latent_dict = self._add_noise(
-            latent=batch_dict['latents'], 
-            train_scheduler=self.train_scheduler_latent, 
-            action_mask=None, 
-            action_mode=False,
-            noisy_cond_prob=0.5)
-
-        vggt_dict = self._add_noise(
-            latent=batch_dict['vggt_latents'],
-            train_scheduler=self.train_scheduler_vggt,
-            vggt_mode=True,
-            action_mask=None,
-            action_mode=False,
-            noisy_cond_prob=0.5)
-
-        action_dict = self._add_noise(
-            latent=batch_dict['actions'], 
-            train_scheduler=self.train_scheduler_action, 
-            action_mask=batch_dict['actions_mask'], 
-            action_mode=True,
-            noisy_cond_prob=0.0)
-
-        latent_dict['text_emb'] = batch_dict['text_emb']
-        vggt_dict['text_emb'] = batch_dict['text_emb']
-        action_dict['text_emb'] = batch_dict['text_emb']
-        action_dict['actions_mask'] = batch_dict['actions_mask']
-
-        input_dict = {
-            'latent_dict': latent_dict,
-            'vggt_dict': vggt_dict,
-            'action_dict': action_dict,
-            'chunk_size': torch.randint(1, 5, (1,)).item(),
-            'window_size': torch.randint(4, 65, (1,)).item(),
-        }
-        return input_dict
-
     def convert_input_format(self, input_dict):
         """Convert input dict to match transformer input format if needed."""
         for key, value in input_dict.items():
@@ -328,16 +232,22 @@ class Trainer:
     def _train_step(self, batch, batch_idx):
         """Train a single batch, returns losses for logging."""
         batch = self.convert_input_format(batch)
-        input_dict = self._prepare_input_dict(batch)
-        
+
         should_sync = (batch_idx + 1) % self.gradient_accumulation_steps == 0
-        
+
         if not should_sync:
             self.transformer.set_requires_gradient_sync(False)
         else:
             self.transformer.set_requires_gradient_sync(True)
 
-        output = self.transformer(input_dict, train_mode=True)
+        # 只调用一次 forward，预处理逻辑已整合到 forward_train 中
+        schedulers = {
+            'latent_scheduler': self.train_scheduler_latent,
+            'vggt_scheduler': self.train_scheduler_vggt,
+            'action_scheduler': self.train_scheduler_action,
+        }
+        output, input_dict = self.transformer(batch, train_mode=True, schedulers=schedulers)
+
         latent_loss, vggt_loss, action_loss = self.compute_loss(input_dict, output)
         loss = latent_loss + vggt_loss + action_loss
 
@@ -367,10 +277,10 @@ class Trainer:
                 options=StateDictOptions(full_state_dict=True, cpu_offload=True),
             )
             state_dict_bf16 = {k: v.to(torch.bfloat16) for k, v in state_dict.items()}
-            # optim_state = get_optimizer_state_dict(
-            #         self.transformer, self.optimizer,
-            #         options=StateDictOptions(full_state_dict=True, cpu_offload=True),
-            #     )
+            optim_state = get_optimizer_state_dict(
+                    self.transformer, self.optimizer,
+                    options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+                )
 
             # Only rank 0 saves the checkpoint
             if self.config.rank == 0:
@@ -396,13 +306,13 @@ class Trainer:
                     json.dump(config_dict, f, indent=2)
 
                 # # Save optimizer state and training metadata in PyTorch format
-                # training_state_path = checkpoint_dir / "training_state.pt"
-                # logger.info(f"Saving training state to {training_state_path}")
-                # torch.save({
-                #     'step': self.step,
-                #     'optimizer_state_dict': optim_state,
-                #     'config': vars(self.config),
-                # }, training_state_path)
+                training_state_path = checkpoint_dir / "training_state.pt"
+                logger.info(f"Saving training state to {training_state_path}")
+                torch.save({
+                    'step': self.step,
+                    'optimizer_state_dict': optim_state,
+                    'config': vars(self.config),
+                }, training_state_path)
 
                 logger.info(f"Checkpoint saved successfully at step {self.step}")
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 """Merge a base Wan transformer checkpoint with newly added VGGT modules."""
 
+import sys
 import argparse
 import inspect
 import json
@@ -12,6 +13,7 @@ from typing import Mapping
 import torch
 from safetensors import safe_open
 
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 DEFAULT_SOURCE = Path("/mi/data2T/Embodied-AI/ckpts/lingbot-va-base/transformer")
 DEFAULT_OUTPUT = Path("/mi/data2T/Embodied-AI/ckpts/lingbot-vggt-base/transformer")
@@ -143,6 +145,8 @@ def merge_checkpoint(model, source_dir: Path) -> Counter:
     )
     missing_keys = sorted(set(target_state.keys()) - set(source_to_targets.keys()))
     expected_new_keys = {
+        "vggt_pre_norm.weight",
+        "vggt_pre_norm.bias",
         "vggt_patch_embedding_mlp.weight",
         "vggt_patch_embedding_mlp.bias",
         "vggt_proj_out.weight",

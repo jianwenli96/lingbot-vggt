@@ -341,13 +341,26 @@ def extract_vggt_latents_from_video(
 
     # [B, C, 3, H, W], where each time step is one VGGT batch item.
     vggt_images = torch.stack(resized_view_frame_tensors, dim=2).to(device=device, dtype=dtype)
-    encoded = vggt_adapter.encode(vggt_images,
-                                  post_norm=True,
-                                  return_dict=True,
-                                  device=vggt_images.device,
-                                  torch_dtype=dtype)
 
-    vggt_latents = encoded["latents"].detach().cpu().to(dtype)
+    # 分批处理避免显存溢出
+    encode_batch_size = getattr(vggt_adapter, "encode_batch_size", 20)  # 可通过adapter属性配置
+    if vggt_images.shape[0] <= encode_batch_size:
+        encoded = vggt_adapter.encode(vggt_images,
+                                      return_dict=True,
+                                      device=vggt_images.device,
+                                      torch_dtype=dtype)
+        vggt_latents = encoded["latents"].detach().cpu().to(dtype)
+    else:
+        # 分批encode后合并
+        all_latents = []
+        for i in range(0, vggt_images.shape[0], encode_batch_size):
+            batch_images = vggt_images[i:i + encode_batch_size]
+            encoded = vggt_adapter.encode(batch_images,
+                                          return_dict=True,
+                                          device=batch_images.device,
+                                          torch_dtype=dtype)
+            all_latents.append(encoded["latents"].detach().cpu().to(dtype))
+        vggt_latents = torch.cat(all_latents, dim=0)
 
     output = {
         "vggt_latents": rearrange(vggt_latents, "b i j c -> (b i j) c"),
@@ -408,7 +421,7 @@ def main():
     parser.add_argument("--vggt-pretrained-model-path", type=str,
                         default="/mi/data2T/Embodied-AI/ckpts/VGGT-Omega/vggt_omega_1b_512.pt",
                         help="Path to VGGT-Omega checkpoint (Required when --enable-vggt is set).")
-    parser.add_argument("--fps", type=float, default=12.5, help="Target FPS")
+    parser.add_argument("--fps", type=float, default=10, help="Target FPS")
     parser.add_argument("--height", type=int, default=256, help="Target height")
     parser.add_argument("--width", type=int, default=320, help="Target width")
     parser.add_argument("--env-type", type=str, default=None,

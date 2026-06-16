@@ -23,7 +23,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 def recursive_find_file(directory, filename='info.json'):
     result = []
     try:
-        for root, dirs, files in os.walk(directory):
+        for root, dirs, files in os.walk(directory, followlinks=True):
             if filename in files:
                 full_path = os.path.join(root, filename)
                 result.append(full_path)

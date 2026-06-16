@@ -114,7 +114,6 @@ class VGGTAdapter(nn.Module):
         self.vggt = vggt
         self.default_image_size = default_image_size
         self.latent_frame_mode = latent_frame_mode
-        self.norm = nn.LayerNorm(latent_dimension, eps=1e-5, elementwise_affine=False)
 
     @classmethod
     def from_pretrained(
@@ -178,7 +177,6 @@ class VGGTAdapter(nn.Module):
     def encode(
         self,
         images: Optional[np.ndarray | torch.Tensor] = None,
-        post_norm: bool = True,
         return_dict: bool = True,
         device: str = "cuda",
         torch_dtype: torch.dtype = torch.bfloat16
@@ -206,9 +204,6 @@ class VGGTAdapter(nn.Module):
         if final_tokens is None:
             raise ValueError("Aggregator did not cache the final layer, which VGGTOmega needs.")
         latents = final_tokens[:, :, :patch_token_start].contiguous().to(torch_dtype) # [B, F, 17, 2048]
-
-        if post_norm:
-            latents = self.norm(latents.float()).to(torch_dtype)
 
         if not return_dict:
             return latents, images, aggregated_tokens_list, patch_token_start
@@ -290,7 +285,6 @@ class VGGTAdapter(nn.Module):
     def forward(
         self,
         images: Optional[np.ndarray | torch.Tensor] = None,
-        post_norm: bool = False,
         return_latents: bool = False,
         device: str = "cuda",
         torch_dtype: torch.dtype = torch.bfloat16
@@ -303,7 +297,7 @@ class VGGTAdapter(nn.Module):
             return_latent: Whether to include latent in output
         """
         # Encode
-        encode_output = self.encode(images, return_dict=True, post_norm=post_norm, device=device, torch_dtype=torch_dtype)
+        encode_output = self.encode(images, return_dict=True, device=device, torch_dtype=torch_dtype)
         # Decode
         decode_output = self.decode(encode_output["images"], encode_output["aggregated_tokens_list"],
                                     encode_output["patch_token_start"], device)
@@ -391,7 +385,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     with torch.no_grad():
-        forward_outputs = adapter(images, return_latents=True, post_norm=False, device=args.device, torch_dtype=torch_dtype)
+        forward_outputs = adapter(images, return_latents=True, device=args.device, torch_dtype=torch_dtype)
         print(f"Forward output keys: {list(forward_outputs.keys())}")
         print(f"  depth shape: {forward_outputs['depth'].shape}")
         print(f"  world_points_from_depth shape: {forward_outputs['world_points_from_depth'].shape}")

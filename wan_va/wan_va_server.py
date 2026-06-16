@@ -100,13 +100,7 @@ class VA_Server:
             torch_device=self.device,
             attn_mode="torch"
         )
-        shard_fn = shard_model
-        self.transformer = _configure_model(model=self.transformer,
-                                            shard_fn=shard_fn,
-                                            param_dtype=self.dtype,
-                                            device=self.device,
-                                            eval_mode=True,
-                                            )
+        self.transformer.eval().requires_grad_(False).to(self.dtype).to(self.device)
 
         self.env_type = job_config.env_type
         self.streaming_vae_half = None
@@ -461,7 +455,6 @@ class VA_Server:
         vggt_images = torch.stack(resized_view_frame_tensors, dim=2).to(
             device=self.device, dtype=self.dtype)
         encoded = self.vggt_adapter.encode(vggt_images,
-                                           post_norm=True,
                                            return_dict=True,
                                            device=self.device.type,
                                            torch_dtype=self.dtype)
@@ -472,6 +465,10 @@ class VA_Server:
             frame_mode=self.job_config.vggt_latent_frame_mode,
             pad_first=True if len(images) == 1 else False
         )
+        
+        # Normalize vggt latents first
+        vggt_latents = self.transformer.vggt_pre_norm(vggt_latents)
+        
         # TODO: the batch size should be 1?
         vggt_latents = rearrange(vggt_latents, "f h w c -> 1 c f h w")
         return vggt_latents.to(self.device, self.dtype)

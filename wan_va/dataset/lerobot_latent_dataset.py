@@ -326,7 +326,6 @@ class LatentLeRobotDataset(LeRobotDataset):
         action_mask = np.ones_like(action, dtype='bool')
         assert action.shape[0] == required_action_num
 
-
         action_paded = np.pad(action, ((0, 0), (0, 1)), mode='constant', constant_values=0)
         action_mask_padded = np.pad(action_mask, ((0, 0), (0, 1)), mode='constant', constant_values=0)
 

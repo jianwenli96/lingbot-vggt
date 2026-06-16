@@ -2,6 +2,9 @@
 import math
 from copy import deepcopy
 
+import os
+import sys
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,6 +28,10 @@ from torch.nn.attention.flex_attention import (
     or_masks
 )
 from functools import partial
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from utils import get_mesh_id, sample_timestep_id
 
 __all__ = ['WanTransformer3DModel']
 
@@ -859,6 +866,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
     _keep_in_fp32_modules = ["time_embedder", 
                              "scale_shift_table", 
                              "scale_shift_table_action",
+                             "vggt_pre_norm",
                              "norm1", 
                              'action_norm1',
                              'text_norm1',
@@ -906,6 +914,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         self.patch_embedding_mlp = nn.Linear(
             in_channels * patch_size[0] * patch_size[1] * patch_size[2],
             inner_dim)
+        self.vggt_pre_norm = FP32LayerNorm(vggt_in_channels, eps, elementwise_affine=True)
         self.vggt_patch_embedding_mlp = nn.Linear(
             vggt_in_channels * vggt_patch_size[0] * vggt_patch_size[1] * vggt_patch_size[2],
             inner_dim)
@@ -998,7 +1007,111 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         timestep_proj = timestep_proj.unflatten(2, (6, -1))  # B L 6 C
         return temb, timestep_proj
 
-    def forward_train(self, input_dict):
+    def _add_noise(self, latent, train_scheduler, vggt_mode=False, action_mask=False, action_mode=False, noisy_cond_prob=0.):
+        B, C, F, H, W = latent.shape
+
+        timestep_ids = sample_timestep_id(batch_size=F, num_train_timesteps=train_scheduler.num_train_timesteps)
+        noise = torch.zeros_like(latent).normal_()
+        timesteps = train_scheduler.timesteps[timestep_ids].to(device=latent.device)
+        noisy_latents = train_scheduler.add_noise(latent, noise, timesteps, t_dim=2)
+        targets = train_scheduler.training_target(latent, noise, timesteps)
+
+        if vggt_mode:
+            patch_f, patch_h, patch_w = self.vggt_patch_size
+        elif action_mode:
+            patch_f = patch_h = patch_w = 1
+        else:
+            patch_f, patch_h, patch_w = self.patch_size
+
+        latent_grid_id = get_mesh_id(
+            latent.shape[-3] // patch_f,  # F
+            latent.shape[-2] // patch_h,  # H
+            latent.shape[-1] // patch_w,  # W
+            t=1 if action_mode else 0,  # 1 for action mode (0 for latent), not used
+            f_w=1,
+            f_shift=0,
+            action=action_mode
+        ).to(self.device)  # shape: [4, seq_len]
+        latent_grid_id = latent_grid_id[None].repeat(B, 1, 1)
+
+        if torch.rand(1).item() < noisy_cond_prob:
+            cond_timestep_ids = sample_timestep_id(
+                    batch_size=F,
+                    min_timestep_bd=0.5,
+                    max_timestep_bd=1.0,
+                    num_train_timesteps=train_scheduler.num_train_timesteps,
+                )
+            noise = torch.zeros_like(latent).normal_()
+            cond_timesteps = train_scheduler.timesteps[cond_timestep_ids].to(device=latent.device)
+            latent = train_scheduler.add_noise(latent, noise, cond_timesteps, t_dim=2)
+        else:
+            cond_timesteps = torch.zeros_like(timesteps)
+
+        if action_mask is not None:
+            noisy_latents *= action_mask.float()
+            targets *= action_mask.float()
+            latent *= action_mask.float()
+
+        return dict(
+            timesteps=timesteps[None].repeat(B, 1),
+            noisy_latents=noisy_latents,
+            targets=targets,
+            latent=latent,
+            cond_timesteps=cond_timesteps[None].repeat(B, 1),
+            grid_id=latent_grid_id,
+        )
+
+    def _prepare_input_dict(self, batch_dict, schedulers):
+        """Prepare input dict following infer code pattern from wan_va_server.py."""
+        # Generate grid_id following infer code (no batch dimension yet)
+        # For action mode: get_mesh_id(shape[-3], shape[-2], shape[-1], t=1, f_w=1, f_shift, action=True)
+        latent_dict = self._add_noise(
+            latent=batch_dict['latents'],
+            train_scheduler=schedulers["latent_scheduler"],
+            action_mask=None,
+            action_mode=False,
+            noisy_cond_prob=0.5)
+
+        vggt_dict = self._add_noise(
+            latent=batch_dict['vggt_latents'],
+            train_scheduler=schedulers["vggt_scheduler"],
+            vggt_mode=True,
+            action_mask=None,
+            action_mode=False,
+            noisy_cond_prob=0.5)
+
+        action_dict = self._add_noise(
+            latent=batch_dict['actions'],
+            train_scheduler=schedulers["action_scheduler"],
+            action_mask=batch_dict['actions_mask'],
+            action_mode=True,
+            noisy_cond_prob=0.0)
+
+        latent_dict['text_emb'] = batch_dict['text_emb']
+        vggt_dict['text_emb'] = batch_dict['text_emb']
+        action_dict['text_emb'] = batch_dict['text_emb']
+        action_dict['actions_mask'] = batch_dict['actions_mask']
+
+        input_dict = {
+            'latent_dict': latent_dict,
+            'vggt_dict': vggt_dict,
+            'action_dict': action_dict,
+            'chunk_size': torch.randint(1, 5, (1,)).item(),
+            'window_size': torch.randint(4, 65, (1,)).item(),
+        }
+        return input_dict
+
+    def forward_train(self, input_dict, schedulers=None):
+        # 1. 先做 vggt_pre_norm (在加噪声之前)
+        input_dict['vggt_latents'] = rearrange(input_dict['vggt_latents'], 'b c f h w -> b f h w c')
+        input_dict['vggt_latents'] = self.vggt_pre_norm(input_dict['vggt_latents'])
+        input_dict['vggt_latents'] = rearrange(input_dict['vggt_latents'], 'b f h w c -> b c f h w')
+
+        # 2. 加噪声
+        input_dict = self._prepare_input_dict(input_dict, schedulers)
+        orig_input_dict = input_dict.copy()
+
+        # 3. 原有逻辑
         input_dict['latent_dict']['noisy_latents'] = input_dict['latent_dict']['noisy_latents'].to(torch.bfloat16)
         input_dict['latent_dict']['latent'] = input_dict['latent_dict']['latent'].to(torch.bfloat16)
         input_dict['vggt_dict']['noisy_latents'] = input_dict['vggt_dict']['noisy_latents'].to(torch.bfloat16)
@@ -1122,7 +1235,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                              '1 (b l) c -> b l c',
                                              b=batch_size)  #
 
-        return latent_hidden_states, vggt_hidden_states, action_hidden_states
+        return (latent_hidden_states, vggt_hidden_states, action_hidden_states), orig_input_dict
 
     def _infer_joint(
         self,
@@ -1195,6 +1308,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         cache_name="pos",
         action_mode=False,
         train_mode=False,
+        schedulers=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -1216,7 +1330,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                 List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
         """
         if train_mode:
-            return self.forward_train(input_dict)
+            return self.forward_train(input_dict, schedulers=schedulers)
         if vggt_dict is not None:
             return self._infer_joint(
                 input_dict,

@@ -12,13 +12,10 @@ def _configure_model(model, shard_fn, param_dtype, device, eval_mode=True):
     if dist.is_initialized():
         dist.barrier()
 
-    # Convert model to target dtype before FSDP sharding
-    # to ensure uniform parameter dtypes across all layers
-    model.to(param_dtype)
-
     if dist.is_initialized():
         model = shard_fn(model)
     else:
+        model.to(param_dtype)
         model.to(device)
 
     return model
