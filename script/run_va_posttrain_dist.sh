@@ -35,10 +35,10 @@ export HCCL_ASYNC_ERROR_HANDLING=0
 export ASCEND_HOME_PATH="/usr/local/Ascend/ascend-toolkit/latest"
 export LOG_TIME=$(date +"%Y%m%d_%H%M%S")
 
-# 到当前文件目录（项目根目录）
+# 到当前文件目录的上一层（项目根目录）
 cd "$(dirname "$0")/.." || exit
 
-/efs-gy1/apps/miniconda3/envs/lingbot-va/bin/python -m torch.distributed.run \
+/root/miniconda3/envs/lingbot-va/bin/python -m torch.distributed.run \
     --nnodes=${NNODES} \
     --node_rank=${NODE_RANK} \
     --master_addr=${MASTER_ADDR} \

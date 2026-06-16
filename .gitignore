@@ -174,7 +174,9 @@ outputs/
 runs/
 wandb/
 tensorboard/
+train_out/
 *.pt
 *.pth
 *.ckpt
 *.safetensors
+*.claude/

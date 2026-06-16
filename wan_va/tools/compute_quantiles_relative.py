@@ -300,7 +300,7 @@ if __name__ == '__main__':
     from wan_va.configs import VA_CONFIGS
     from tqdm import tqdm
     dset = MultiLatentLeRobotDataset(
-        VA_CONFIGS['teleavatar_train'],
+        VA_CONFIGS['aloha_3dcmp_train'],
         num_init_worker=128
     )
     dloader = DataLoader(

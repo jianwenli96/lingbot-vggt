@@ -1109,7 +1109,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
 
         # 2. 加噪声
         input_dict = self._prepare_input_dict(input_dict, schedulers)
-        orig_input_dict = input_dict.copy()
 
         # 3. 原有逻辑
         input_dict['latent_dict']['noisy_latents'] = input_dict['latent_dict']['noisy_latents'].to(torch.bfloat16)
@@ -1235,7 +1234,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                              '1 (b l) c -> b l c',
                                              b=batch_size)  #
 
-        return (latent_hidden_states, vggt_hidden_states, action_hidden_states), orig_input_dict
+        # 返回预测结果和 input_dict（用于 compute_loss）
+        return (latent_hidden_states, vggt_hidden_states, action_hidden_states), input_dict
 
     def _infer_joint(
         self,
