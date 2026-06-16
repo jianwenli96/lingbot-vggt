@@ -34,6 +34,7 @@ from modules.utils import (
     load_transformer,
     load_vae,
 )
+from modules.vggt_adapter import VGGTAdapter
 from utils import (
     FlowMatchScheduler,
     data_seq_to_patch,
@@ -42,6 +43,7 @@ from utils import (
     logger,
     run_async_server_mode,
     save_async,
+    merge_vggt_latents,
 )
 
 
@@ -104,6 +106,25 @@ class VA_Server:
 
         self.env_type = job_config.env_type
         self.streaming_vae_half = None
+
+        self.vggt_latent_dimension = getattr(job_config, "vggt_latent_dimension", 2048)
+        self.vggt_latent_width = getattr(job_config, "vggt_latent_width", 17)
+        self.vggt_latent_height = getattr(job_config, "vggt_latent_height", 4 * len(job_config.obs_cam_keys))
+        vggt_adapter_config = {
+            "default_image_size": getattr(job_config, "vggt_image_size", [512, 512]),
+            "latent_frame_mode": getattr(job_config, "vggt_latent_frame_mode", "concat"),
+            "latent_dimension": self.vggt_latent_dimension
+        }
+        if isinstance(vggt_adapter_config["default_image_size"], int):
+            vggt_adapter_config["default_image_size"] = [vggt_adapter_config["default_image_size"]] * 2
+        self.vggt_adapter = VGGTAdapter.from_pretrained(
+            vggt_adapter_config=vggt_adapter_config,
+            vggt_pretrained_path=job_config.vggt_pretrained_model_name_or_path,
+            device=self.device.type,
+            torch_dtype=self.dtype,
+        )
+        self.vggt_adapter.eval()
+
         if self.env_type == 'robotwin_tshape':
             vae_half = load_vae(
                 os.path.join(job_config.wan22_pretrained_model_name_or_path,
@@ -274,15 +295,20 @@ class VA_Server:
 
     def _prepare_latent_input(self,
                               latent_model_input,
+                              vggt_model_input,
                               action_model_input,
-                              latent_t=0,
+                              visual_t=0,
                               action_t=0,
                               latent_cond=None,
+                              vggt_cond=None,
                               action_cond=None,
-                              frame_st_id=0,
-                              patch_size=(1, 2, 2)):
+                              frame_st_id=0):
         logger.info(f"FRAME START ID: {frame_st_id}")
         input_dict = dict()
+
+        patch_size = self.job_config.patch_size
+        vggt_patch_size = self.job_config.vggt_patch_size
+
         if latent_model_input is not None:
             input_dict['latent_res_lst'] = {
                 'noisy_latents':
@@ -290,7 +316,7 @@ class VA_Server:
                 'timesteps':
                 torch.ones([latent_model_input.shape[2]],
                            dtype=torch.float32,
-                           device=self.device) * latent_t,
+                           device=self.device) * visual_t,
                 'grid_id':
                 get_mesh_id(latent_model_input.shape[-3] // patch_size[0],
                             latent_model_input.shape[-2] // patch_size[1],
@@ -303,6 +329,27 @@ class VA_Server:
                 input_dict['latent_res_lst'][
                     'noisy_latents'][:, :, 0:1] = latent_cond[:, :, 0:1]
                 input_dict['latent_res_lst']['timesteps'][0:1] *= 0
+
+        if vggt_model_input is not None:
+            input_dict['vggt_res_lst'] = {
+                'noisy_latents':
+                vggt_model_input,
+                'timesteps':
+                torch.ones([vggt_model_input.shape[2]],
+                           dtype=torch.float32,
+                           device=self.device) * visual_t,
+                'grid_id':
+                get_mesh_id(vggt_model_input.shape[-3] // vggt_patch_size[0],
+                            vggt_model_input.shape[-2] // vggt_patch_size[1],
+                            vggt_model_input.shape[-1] // vggt_patch_size[2], 0,
+                            1, frame_st_id).to(self.device),
+                'text_emb':
+                self.prompt_embeds.to(self.dtype).clone(),
+            }
+            if vggt_cond is not None:
+                input_dict['vggt_res_lst'][
+                    'noisy_latents'][:, :, 0:1] = vggt_cond[:, :, 0:1]
+                input_dict['vggt_res_lst']['timesteps'][0:1] *= 0
 
         if action_model_input is not None:
             input_dict['action_res_lst'] = {
@@ -384,12 +431,55 @@ class VA_Server:
         video_latent = torch.cat(mu_norm.split(1, dim=0), dim=-1)
         return video_latent.to(self.device)
 
+    def _encode_vggt_obs(self, obs, target_num_frames):
+        images = obs['obs']
+        if not isinstance(images, list):
+            images = [images]
+        view_frame_tensors = []
+        for key in self.job_config.obs_cam_keys:
+            frames = torch.from_numpy(
+                np.stack([each[key] for each in images])).float().permute(3, 0, 1, 2)
+            view_frame_tensors.append(frames)
+        resized_target_size = (
+            max(int(frames.shape[2]) for frames in view_frame_tensors),
+            max(int(frames.shape[3]) for frames in view_frame_tensors),
+        )
+        resized_view_frame_tensors = []
+        for frames in view_frame_tensors:
+            frames = (frames / 255.0).clamp(0.0, 1.0)
+            frames = rearrange(frames, "c f h w -> f c h w")
+            frames = F.interpolate(frames,
+                                   size=resized_target_size,
+                                   mode="bilinear",
+                                   align_corners=False)
+            resized_view_frame_tensors.append(frames)
+        vggt_images = torch.stack(resized_view_frame_tensors, dim=2).to(
+            device=self.device, dtype=self.dtype)
+        encoded = self.vggt_adapter.encode(vggt_images,
+                                           post_norm=True,
+                                           return_dict=True,
+                                           device=self.device.type,
+                                           torch_dtype=self.dtype)
+        # The images length would be 1, 4, or 8, thus set pad_first to False for 4 and 8
+        vggt_latents = merge_vggt_latents(
+            encoded["latents"].detach(),
+            target_num_frames=target_num_frames,
+            frame_mode=self.job_config.vggt_latent_frame_mode,
+            pad_first=True if len(images) == 1 else False
+        )
+        # TODO: the batch size should be 1?
+        vggt_latents = rearrange(vggt_latents, "f h w c -> 1 c f h w")
+        return vggt_latents.to(self.device, self.dtype)
+
     def _reset(self, prompt=None):
         logger.info('Reset.')
-        self.use_cfg = (self.job_config.guidance_scale > 1) or (self.job_config.action_guidance_scale > 1)
+        self.visual_use_cfg = self.job_config.guidance_scale > 1
+        self.action_use_cfg = self.job_config.action_guidance_scale > 1
+        self.use_cfg = self.visual_use_cfg or self.action_use_cfg
         #### Reset all parameters
         self.frame_st_id = 0
         self.init_latent = None
+        self.init_vggt = None
         #### clean vae and transformer cache
         self.transformer.clear_cache(self.cache_name)
         self.streaming_vae.clear_cache()
@@ -406,18 +496,24 @@ class VA_Server:
                 self.job_config.obs_cam_keys)
 
         patch_size = self.job_config.patch_size
-        latent_token_per_chunk = (self.job_config.frame_chunk_size *
+        vggt_patch_size = self.job_config.vggt_patch_size
+        video_token_per_chunk = (self.job_config.frame_chunk_size *
                                   self.latent_height * self.latent_width) // (
                                       patch_size[0] * patch_size[1] *
                                       patch_size[2])
+        vggt_token_per_chunk = (self.job_config.frame_chunk_size *
+                                self.vggt_latent_height * self.vggt_latent_width) // (
+                                    vggt_patch_size[0] * vggt_patch_size[1] *
+                                    vggt_patch_size[2])
         action_token_per_chunk = self.job_config.frame_chunk_size * self.action_per_frame
+        visual_token_per_chunk = video_token_per_chunk + vggt_token_per_chunk
         self.transformer.create_empty_cache(self.cache_name,
                                             self.job_config.attn_window,
-                                            latent_token_per_chunk,
+                                            visual_token_per_chunk,
                                             action_token_per_chunk,
                                             dtype=self.dtype,
                                             device=self.device,
-                                            batch_size = 2 if self.use_cfg else 1
+                                            batch_size=2 if self.use_cfg else 1
                                             )
 
         self.action_mask = torch.zeros([self.job_config.action_dim]).bool()
@@ -436,7 +532,7 @@ class VA_Server:
             self.prompt_embeds, self.negative_prompt_embeds = self.encode_prompt(
                 prompt=prompt,
                 negative_prompt=None,
-                do_classifier_free_guidance=self.job_config.guidance_scale > 1,
+                do_classifier_free_guidance=self.use_cfg,
                 num_videos_per_prompt=1,
                 prompt_embeds=None,
                 negative_prompt_embeds=None,
@@ -454,7 +550,9 @@ class VA_Server:
         frame_chunk_size = self.job_config.frame_chunk_size
         if frame_st_id == 0:
             init_latent = self._encode_obs(obs)
+            init_vggt = self._encode_vggt_obs(obs, init_latent.shape[2])
             self.init_latent = init_latent
+            self.init_vggt = init_vggt
 
         latents = torch.randn(1,
                               48,
@@ -463,6 +561,13 @@ class VA_Server:
                               self.latent_width,
                               device=self.device,
                               dtype=self.dtype)
+        vggt_latents = torch.randn(1,
+                                   self.vggt_latent_dimension,
+                                   frame_chunk_size,
+                                   self.vggt_latent_height,
+                                   self.vggt_latent_width,
+                                   device=self.device,
+                                   dtype=self.dtype)
         actions = torch.randn(1,
                               self.job_config.action_dim,
                               frame_chunk_size,
@@ -495,22 +600,31 @@ class VA_Server:
         with (
                 torch.no_grad(),
         ):
-            # 1. Video Generation Loop
+            # 1. Joint Video/VGGT Generation Loop
             for i, t in enumerate(tqdm(timesteps)):
                 last_step = i == len(timesteps) - 1
                 latent_cond = init_latent[:, :, 0:1].to(
                     self.dtype) if frame_st_id == 0 else None
+                vggt_cond = init_vggt[:, :, 0:1].to(
+                    self.dtype) if frame_st_id == 0 else None
                 input_dict = self._prepare_latent_input(
                     latents,
+                    vggt_latents,
                     None,
-                    t,
-                    t,
-                    latent_cond,
-                    None,
+                    visual_t=t,
+                    latent_cond=latent_cond,
+                    vggt_cond=vggt_cond,
                     frame_st_id=frame_st_id)
 
-                video_noise_pred = self.transformer(
-                    self._repeat_input_for_cfg(input_dict['latent_res_lst']),
+                latent_input = self._repeat_input_for_cfg(
+                    input_dict['latent_res_lst']
+                )
+                vggt_input = self._repeat_input_for_cfg(
+                    input_dict['vggt_res_lst']
+                )
+                video_noise_pred, vggt_noise_pred = self.transformer(
+                    latent_input,
+                    vggt_dict=vggt_input,
                     update_cache=1 if last_step else 0,
                     cache_name=self.cache_name,
                     action_mode=False)
@@ -520,7 +634,7 @@ class VA_Server:
                         self.job_config.patch_size, video_noise_pred,
                         frame_chunk_size, self.latent_height,
                         self.latent_width, batch_size=2 if self.use_cfg else 1)
-                    if self.job_config.guidance_scale > 1:
+                    if self.visual_use_cfg:
                         video_noise_pred = video_noise_pred[1:] + self.job_config.guidance_scale * (video_noise_pred[:1] - video_noise_pred[1:])
                     else:
                         video_noise_pred = video_noise_pred[:1]
@@ -528,9 +642,23 @@ class VA_Server:
                                                   t,
                                                   latents,
                                                   return_dict=False)
+                    vggt_noise_pred = data_seq_to_patch(
+                        self.job_config.vggt_patch_size, vggt_noise_pred,
+                        frame_chunk_size, self.vggt_latent_height,
+                        self.vggt_latent_width, batch_size=2 if self.use_cfg else 1)
+                    if self.visual_use_cfg:
+                        vggt_noise_pred = vggt_noise_pred[1:] + self.job_config.guidance_scale * (vggt_noise_pred[:1] - vggt_noise_pred[1:])
+                    else:
+                        vggt_noise_pred = vggt_noise_pred[:1]
+                    vggt_latents = self.scheduler.step(vggt_noise_pred,
+                                                       t,
+                                                       vggt_latents,
+                                                       return_dict=False)
 
                 latents[:, :, 0:1] = latent_cond if frame_st_id == 0 else latents[:, :, 0:1]
+                vggt_latents[:, :, 0:1] = vggt_cond if frame_st_id == 0 else vggt_latents[:, :, 0:1]
 
+            # 2. Action Generation Loop
             for i, t in enumerate(tqdm(action_timesteps)):
                 last_step = i == len(action_timesteps) - 1
                 action_cond = torch.zeros(
@@ -543,14 +671,15 @@ class VA_Server:
 
                 input_dict = self._prepare_latent_input(
                     None,
-                    actions,
-                    t,
-                    t,
                     None,
-                    action_cond,
+                    actions,
+                    action_t=t,
+                    action_cond=action_cond,
                     frame_st_id=frame_st_id)
                 action_noise_pred = self.transformer(
-                    self._repeat_input_for_cfg(input_dict['action_res_lst']),
+                    self._repeat_input_for_cfg(
+                        input_dict['action_res_lst']
+                    ),
                     update_cache=1 if last_step else 0,
                     cache_name=self.cache_name,
                     action_mode=True)
@@ -559,7 +688,7 @@ class VA_Server:
                     action_noise_pred = rearrange(action_noise_pred,
                                                   'b (f n) c -> b c f n 1',
                                                   f=frame_chunk_size)
-                    if self.job_config.action_guidance_scale > 1:
+                    if self.action_use_cfg:
                         action_noise_pred = action_noise_pred[1:] + self.job_config.action_guidance_scale * (action_noise_pred[:1] - action_noise_pred[1:])
                     else:
                         action_noise_pred = action_noise_pred[:1]
@@ -573,40 +702,53 @@ class VA_Server:
         actions[:, ~self.action_mask] *= 0
 
         save_async(latents, os.path.join(self.exp_save_root, f'latents_{frame_st_id}.pt'))
+        save_async(vggt_latents, os.path.join(self.exp_save_root, f'vggt_latents_{frame_st_id}.pt'))
         save_async(actions, os.path.join(self.exp_save_root, f'actions_{frame_st_id}.pt'))
 
         actions = self.postprocess_action(actions)
         torch.cuda.empty_cache()
-        return actions, latents
+        return actions, latents, vggt_latents
 
     def _compute_kv_cache(self, obs):
         ### optional async save obs for debug
         self.transformer.clear_pred_cache(self.cache_name)
         save_async(obs['obs'], os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt'))
         latent_model_input = self._encode_obs(obs)
+        vggt_model_input = self._encode_vggt_obs(obs, latent_model_input.shape[2])
         if self.frame_st_id == 0:
             latent_model_input = torch.cat(
                 [self.init_latent, latent_model_input],
                 dim=2) if latent_model_input is not None else self.init_latent
-
+            vggt_model_input = torch.cat(
+                [self.init_vggt, vggt_model_input],
+                dim=2) if vggt_model_input is not None else self.init_vggt
         action_model_input = self.preprocess_action(obs['state'])
         action_model_input = action_model_input.to(latent_model_input)
         logger.info(
-            f"get KV cache obs: {latent_model_input.shape} {action_model_input.shape}"
+            f"get KV cache obs: {latent_model_input.shape} {vggt_model_input.shape} {action_model_input.shape}"
         )
         input_dict = self._prepare_latent_input(latent_model_input,
+                                                vggt_model_input,
                                                 action_model_input,
                                                 frame_st_id=self.frame_st_id)
 
         with (
                 torch.no_grad(),
         ):
-            self.transformer(self._repeat_input_for_cfg(input_dict['latent_res_lst']),
+            latent_input = self._repeat_input_for_cfg(
+                input_dict['latent_res_lst']
+            )
+            vggt_input = self._repeat_input_for_cfg(
+                input_dict['vggt_res_lst']
+            )
+            self.transformer(latent_input,
+                             vggt_dict=vggt_input,
                              update_cache=2,
                              cache_name=self.cache_name,
                              action_mode=False)
 
-            self.transformer(self._repeat_input_for_cfg(input_dict['action_res_lst']),
+            self.transformer(self._repeat_input_for_cfg(
+                                 input_dict['action_res_lst']),
                              update_cache=2,
                              cache_name=self.cache_name,
                              action_mode=True)
@@ -630,7 +772,7 @@ class VA_Server:
             return dict()
         else:
             logger.info(f"################# Infer One Chunk #################")
-            action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
+            action, _, _ = self._infer(obs, frame_st_id=self.frame_st_id)
             return dict(action=action)
     
     def decode_one_video(self, latents, output_type):
@@ -660,13 +802,16 @@ class VA_Server:
         self._reset(self.job_config.prompt)
         init_obs = self.load_init_obs()
         pred_latent_lst = []
+        pred_vggt_lst = []
         pred_action_lst = []
         for chunk_id in range(self.job_config.num_chunks_to_infer):
-            actions, latents = self._infer(init_obs, frame_st_id=(chunk_id * self.job_config.frame_chunk_size))
+            actions, latents, vggt_latents = self._infer(init_obs, frame_st_id=(chunk_id * self.job_config.frame_chunk_size))
             actions = torch.from_numpy(actions)
             pred_latent_lst.append(latents)
+            pred_vggt_lst.append(vggt_latents)
             pred_action_lst.append(actions)
         pred_latent = torch.cat(pred_latent_lst, dim=2)
+        pred_vggt = torch.cat(pred_vggt_lst, dim=2)
         pred_action = torch.cat(pred_action_lst, dim=1).flatten(1)
         self.transformer.clear_cache(self.cache_name)
         self.streaming_vae.clear_cache()

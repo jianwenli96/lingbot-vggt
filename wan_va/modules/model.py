@@ -1,6 +1,7 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import math
 from copy import deepcopy
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -26,7 +27,115 @@ from torch.nn.attention.flex_attention import (
 )
 from functools import partial
 
-__all__ = ['WanTransformer3DModel']
+__all__ = [
+    'WanTransformer3DModel',
+    'build_training_token_metadata',
+    'pack_visual_tokens',
+    'unpack_visual_tokens',
+]
+
+
+@dataclass(frozen=True)
+class VisualTokenLayout:
+    num_frames: int
+    video_tokens_per_frame: int
+    vggt_tokens_per_frame: int
+
+    @property
+    def tokens_per_frame(self):
+        return self.video_tokens_per_frame + self.vggt_tokens_per_frame
+
+
+def pack_visual_tokens(video_tokens, vggt_tokens):
+    """Concatenate video and VGGT tokens within each frame."""
+    if video_tokens.ndim != 4 or vggt_tokens.ndim != 4:
+        raise ValueError(
+            "visual tokens must have shape [B, F, N, D], got "
+            f"{tuple(video_tokens.shape)} and {tuple(vggt_tokens.shape)}"
+        )
+    if video_tokens.shape[:2] != vggt_tokens.shape[:2]:
+        raise ValueError(
+            "video and VGGT batch and frame dimensions must match, got "
+            f"{tuple(video_tokens.shape[:2])} and {tuple(vggt_tokens.shape[:2])}"
+        )
+    if video_tokens.shape[-1] != vggt_tokens.shape[-1]:
+        raise ValueError(
+            "video and VGGT hidden dimensions must match, got "
+            f"{video_tokens.shape[-1]} and {vggt_tokens.shape[-1]}"
+        )
+    return torch.cat([video_tokens, vggt_tokens], dim=2)
+
+
+def unpack_visual_tokens(
+    joint_tokens,
+    video_tokens_per_frame,
+    vggt_tokens_per_frame,
+):
+    """Split a per-frame joint visual sequence back into its modalities."""
+    if joint_tokens.ndim != 4:
+        raise ValueError(
+            "joint visual tokens must have shape [B, F, N, D], got "
+            f"{tuple(joint_tokens.shape)}"
+        )
+    expected_tokens = video_tokens_per_frame + vggt_tokens_per_frame
+    if joint_tokens.shape[2] != expected_tokens:
+        raise ValueError(
+            f"expected {expected_tokens} tokens per frame, got "
+            f"{joint_tokens.shape[2]}"
+        )
+    return torch.split(
+        joint_tokens,
+        [video_tokens_per_frame, vggt_tokens_per_frame],
+        dim=2,
+    )
+
+
+def build_training_token_metadata(
+    batch_size,
+    num_visual_frames,
+    visual_tokens_per_frame,
+    action_shape,
+    chunk_size,
+):
+    """Build sequence, frame, and noise IDs for joint visual/action training."""
+    action_batch, action_frames, action_height, action_width = action_shape
+    if action_batch != batch_size:
+        raise ValueError(
+            f"visual and action batch sizes must match, got {batch_size} and {action_batch}"
+        )
+    visual_seq_ids = torch.arange(batch_size)[:, None, None].expand(
+        -1, num_visual_frames, visual_tokens_per_frame
+    ).flatten()
+    action_seq_ids = torch.arange(batch_size)[:, None, None, None].expand(
+        -1, action_frames, action_height, action_width
+    ).flatten()
+    seq_ids = torch.cat(
+        [visual_seq_ids, visual_seq_ids, action_seq_ids, action_seq_ids]
+    )
+
+    visual_frame_ids = torch.arange(num_visual_frames)[None, :, None].expand(
+        batch_size, -1, visual_tokens_per_frame
+    ).flatten()
+    action_frame_ids = torch.arange(action_frames)[None, :, None, None].expand(
+        batch_size, -1, action_height, action_width
+    ).flatten()
+    frame_ids = torch.cat(
+        [
+            visual_frame_ids // chunk_size * 2,
+            visual_frame_ids // chunk_size * 2,
+            action_frame_ids // chunk_size * 2 + 1,
+            action_frame_ids // chunk_size * 2 + 1,
+        ]
+    )
+    noise_ids = torch.cat(
+        [
+            torch.zeros_like(visual_frame_ids),
+            torch.ones_like(visual_frame_ids),
+            torch.zeros_like(action_frame_ids),
+            torch.ones_like(action_frame_ids),
+        ]
+    )
+    return seq_ids, frame_ids, noise_ids
 
 
 def custom_sdpa(q, k, v, **kwargs):
@@ -94,12 +203,13 @@ class SDPAAttnFunc(nn.Module):
     @staticmethod
     @torch.no_grad()
     def init_mask(
-        latent_shape,
+        batch_size,
+        num_visual_frames,
+        visual_tokens_per_frame,
         action_shape,
         padded_length,
         chunk_size,
         window_size,
-        patch_size,
         device,
         dtype,
     ):
@@ -107,28 +217,13 @@ class SDPAAttnFunc(nn.Module):
         初始化attention mask
         将FlexAttention的掩码逻辑转换为标准的布尔或浮点掩码张量
         """
-        B, _, L_F, L_H, L_W = latent_shape
-        _, _, A_F, A_H, A_W = action_shape
-
-        # 构建序列ID
-        latent_seq_id = torch.arange(B)[:, None, None, None].\
-            expand(-1, L_F // patch_size[0], L_H // patch_size[1], L_W // patch_size[2]).flatten()
-        action_seq_id = torch.arange(B)[:, None, None, None].expand(-1, A_F, A_H, A_W).flatten()
-        seq_ids = torch.cat([latent_seq_id] * 2 + [action_seq_id] * 2)
-
-        # 构建帧ID
-        latent_frame_id = torch.arange(L_F)[None, :, None, None].expand(B, -1, L_H // patch_size[1], L_W // patch_size[2])[None].flatten()
-        action_frame_id = torch.arange(A_F)[None, :, None, None].expand(B, -1, A_H, A_W)[None].flatten()
-        frame_ids = torch.cat([latent_frame_id // chunk_size * 2] * 2 + [action_frame_id // chunk_size * 2 + 1] * 2)
-
-        # 构建noise ID
-        noise_ids = torch.cat(
-            [
-                torch.zeros_like(latent_frame_id),
-                torch.ones_like(latent_frame_id),
-                torch.zeros_like(action_frame_id),
-                torch.ones_like(action_frame_id),
-            ]
+        _, _, action_frames, action_height, action_width = action_shape
+        seq_ids, frame_ids, noise_ids = build_training_token_metadata(
+            batch_size=batch_size,
+            num_visual_frames=num_visual_frames,
+            visual_tokens_per_frame=visual_tokens_per_frame,
+            action_shape=(batch_size, action_frames, action_height, action_width),
+            chunk_size=chunk_size,
         )
 
         # Padding
@@ -149,7 +244,7 @@ class SDPAAttnFunc(nn.Module):
         SDPAAttnFunc.seq_len = len(seq_ids)
 
         # 生成交叉注意力掩码
-        text_seq_ids = torch.arange(B)[:, None].expand(-1, 512).flatten()
+        text_seq_ids = torch.arange(batch_size)[:, None].expand(-1, 512).flatten()
         text_seq_ids = text_seq_ids.long().to(device)
         cross_attention_mask = SDPAAttnFunc._create_cross_attention_mask(
             seq_ids, text_seq_ids, device
@@ -305,34 +400,23 @@ class FlexAttnFunc(nn.Module):
     @staticmethod
     @torch.no_grad()
     def init_mask(
-        latent_shape, 
+        batch_size,
+        num_visual_frames,
+        visual_tokens_per_frame,
         action_shape, 
         padded_length, 
         chunk_size,
         window_size,
-        patch_size,
         device,
     ):
         torch._inductor.config.realize_opcount_threshold = 100
-        B, _, L_F, L_H, L_W = latent_shape
-        _, _, A_F, A_H, A_W = action_shape
-
-        latent_seq_id = torch.arange(B)[:, None, None, None].\
-            expand(-1, L_F // patch_size[0], L_H // patch_size[1], L_W // patch_size[2]).flatten()
-        action_seq_id = torch.arange(B)[:, None, None, None].expand(-1, A_F, A_H, A_W).flatten()
-        seq_ids = torch.cat([latent_seq_id] * 2 + [action_seq_id] * 2)
-
-        latent_frame_id = torch.arange(L_F)[None, :, None, None].expand(B, -1, L_H // patch_size[1], L_W // patch_size[2])[None].flatten()
-        action_frame_id = torch.arange(A_F)[None, :, None, None].expand(B, -1, A_H, A_W)[None].flatten()
-        frame_ids = torch.cat([latent_frame_id // chunk_size * 2] * 2 + [action_frame_id // chunk_size * 2 + 1] * 2)
-
-        noise_ids = torch.cat(
-            [
-                torch.zeros_like(latent_frame_id),
-                torch.ones_like(latent_frame_id),
-                torch.zeros_like(action_frame_id),
-                torch.ones_like(action_frame_id),
-            ]
+        _, _, action_frames, action_height, action_width = action_shape
+        seq_ids, frame_ids, noise_ids = build_training_token_metadata(
+            batch_size=batch_size,
+            num_visual_frames=num_visual_frames,
+            visual_tokens_per_frame=visual_tokens_per_frame,
+            action_shape=(batch_size, action_frames, action_height, action_width),
+            chunk_size=chunk_size,
         )
 
         seq_ids = F.pad(seq_ids, (0, padded_length), value=-1)
@@ -345,7 +429,7 @@ class FlexAttnFunc(nn.Module):
             )
         FlexAttnFunc.attention_mask = block_mask
 
-        text_seq_ids = torch.arange(B)[:, None].expand(-1, 512).flatten()
+        text_seq_ids = torch.arange(batch_size)[:, None].expand(-1, 512).flatten()
         mask_mod_cross = FlexAttnFunc._get_cross_mask_mod(seq_ids.long().to(device), text_seq_ids.long().to(device))
         block_mask_cross = FlexAttnFunc.compiled_create_block_mask(
                 mask_mod_cross, 1, 1, len(seq_ids), len(text_seq_ids), device=device, _compile=True
@@ -835,6 +919,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
     _skip_layerwise_casting_patterns = [
                                         # "patch_embedding", 
                                         "patch_embedding_mlp",
+                                        "vggt_patch_embedding_mlp",
                                         "condition_embedder", 
                                         'condition_embedder_action',
                                         "norm"]
@@ -858,10 +943,13 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
     @register_to_config
     def __init__(self,
                  patch_size=[1, 2, 2],
+                 vggt_patch_size=[1, 1, 1],
                  num_attention_heads=24,
                  attention_head_dim=128,
                  in_channels=48,
                  out_channels=48,
+                 vggt_in_channels=2048,
+                 vggt_out_channels=2048,
                  action_dim=30,
                  text_dim=4096,
                  freq_dim=256,
@@ -877,6 +965,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         """
         super().__init__()
         self.patch_size = patch_size
+        self.vggt_patch_size = vggt_patch_size
         self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
         inner_dim = num_attention_heads * attention_head_dim
@@ -885,6 +974,15 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         self.patch_embedding_mlp = nn.Linear(
             in_channels * patch_size[0] * patch_size[1] * patch_size[2],
             inner_dim)
+        self.vggt_patch_embedding_mlp = nn.Linear(
+            vggt_in_channels * vggt_patch_size[0] * vggt_patch_size[1] * vggt_patch_size[2],
+            inner_dim)
+        self.video_modality_embedding = nn.Parameter(
+            torch.zeros(1, 1, 1, inner_dim)
+        )
+        self.vggt_modality_embedding = nn.Parameter(
+            torch.zeros(1, 1, 1, inner_dim)
+        )
         self.action_embedder = nn.Linear(action_dim, inner_dim)
         self.condition_embedder = WanTimeTextImageEmbedding(
             dim=inner_dim,
@@ -907,6 +1005,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         self.norm_out = FP32LayerNorm(inner_dim, eps, elementwise_affine=False)
         self.proj_out = nn.Linear(inner_dim,
                                   out_channels * math.prod(patch_size))
+        self.vggt_proj_out = nn.Linear(inner_dim,
+                                       vggt_out_channels * math.prod(vggt_patch_size))
         self.action_proj_out = nn.Linear(inner_dim, action_dim)
         self.scale_shift_table = nn.Parameter(
             torch.randn(1, 2, inner_dim) / inner_dim**0.5)
@@ -919,11 +1019,24 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         for block in self.blocks:
             block.attn1.clear_pred_cache(cache_name)
 
+    @staticmethod
+    def cache_token_capacity(
+        attn_window,
+        visual_token_per_chunk,
+        action_token_per_chunk,
+    ):
+        return (attn_window // 2) * (
+            visual_token_per_chunk + action_token_per_chunk
+        )
+
     def create_empty_cache(self, cache_name, attn_window,
-                           latent_token_per_chunk, action_token_per_chunk,
+                           visual_token_per_chunk, action_token_per_chunk,
                            device, dtype, batch_size):
-        total_tolen = (attn_window // 2) * latent_token_per_chunk + (
-            attn_window // 2) * action_token_per_chunk
+        total_tolen = self.cache_token_capacity(
+            attn_window,
+            visual_token_per_chunk,
+            action_token_per_chunk,
+        )
         for block in self.blocks:
             block.attn1.init_kv_cache(cache_name, total_tolen,
                                       self.num_attention_heads,
@@ -938,6 +1051,14 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                 p2=self.patch_size[1],
                 p3=self.patch_size[2])
             hidden_states = self.patch_embedding_mlp(hidden_states)
+        elif input_type == 'vggt_latent':
+            hidden_states = rearrange(
+                latents,
+                'b c (f p1) (h p2) (w p3) -> b (f h w) (c p1 p2 p3)',
+                p1=self.vggt_patch_size[0],
+                p2=self.vggt_patch_size[1],
+                p3=self.vggt_patch_size[2])
+            hidden_states = self.vggt_patch_embedding_mlp(hidden_states)
         elif input_type == 'action':
             hidden_states = rearrange(latents, 'b c f h w -> b (f h w) c')
             hidden_states = self.action_embedder(hidden_states)
@@ -947,9 +1068,172 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             raise ValueError(f"Unsupported input type: {input_type}")
         return hidden_states
 
-    def _time_embed(self, timesteps, H, W, dtype, action_mode=False):
-        pach_scale_h, pach_scale_w = (1, 1) if action_mode else (
-            self.patch_size[1], self.patch_size[2])
+    def _pack_visual_hidden_states(self, video_latents, vggt_latents):
+        if video_latents.shape[2] % self.patch_size[0] != 0:
+            raise ValueError(
+                f"video frame count {video_latents.shape[2]} is not divisible by "
+                f"temporal patch size {self.patch_size[0]}"
+            )
+        if vggt_latents.shape[2] % self.vggt_patch_size[0] != 0:
+            raise ValueError(
+                f"VGGT frame count {vggt_latents.shape[2]} is not divisible by "
+                f"temporal patch size {self.vggt_patch_size[0]}"
+            )
+        video_frames = video_latents.shape[2] // self.patch_size[0]
+        vggt_frames = vggt_latents.shape[2] // self.vggt_patch_size[0]
+        if video_frames != vggt_frames:
+            raise ValueError(
+                "video and VGGT must produce the same number of token frames, got "
+                f"{video_frames} and {vggt_frames}"
+            )
+
+        video_tokens = self._input_embed(video_latents, input_type='latent')
+        vggt_tokens = self._input_embed(vggt_latents, input_type='vggt_latent')
+        if video_tokens.shape[1] % video_frames != 0:
+            raise ValueError("video token count is not divisible by its frame count")
+        if vggt_tokens.shape[1] % vggt_frames != 0:
+            raise ValueError("VGGT token count is not divisible by its frame count")
+
+        video_tokens_per_frame = video_tokens.shape[1] // video_frames
+        vggt_tokens_per_frame = vggt_tokens.shape[1] // vggt_frames
+        video_tokens = video_tokens.reshape(
+            video_tokens.shape[0], video_frames, video_tokens_per_frame, -1
+        )
+        vggt_tokens = vggt_tokens.reshape(
+            vggt_tokens.shape[0], vggt_frames, vggt_tokens_per_frame, -1
+        )
+        video_tokens = video_tokens + self.video_modality_embedding
+        vggt_tokens = vggt_tokens + self.vggt_modality_embedding
+        layout = VisualTokenLayout(
+            num_frames=video_frames,
+            video_tokens_per_frame=video_tokens_per_frame,
+            vggt_tokens_per_frame=vggt_tokens_per_frame,
+        )
+        return pack_visual_tokens(video_tokens, vggt_tokens), layout
+
+    def _pack_visual_grid_ids(
+        self,
+        video_grid_ids,
+        vggt_grid_ids,
+        num_frames,
+        video_tokens_per_frame,
+        vggt_tokens_per_frame,
+    ):
+        if (
+            video_grid_ids.ndim != 3
+            or vggt_grid_ids.ndim != 3
+            or video_grid_ids.shape[1] != 4
+            or vggt_grid_ids.shape[1] != 4
+            or video_grid_ids.shape[0] != vggt_grid_ids.shape[0]
+        ):
+            raise ValueError(
+                "video and VGGT grid IDs must have matching batch size and shape [B, 4, L]"
+            )
+        expected_video_tokens = num_frames * video_tokens_per_frame
+        expected_vggt_tokens = num_frames * vggt_tokens_per_frame
+        if video_grid_ids.shape[2] != expected_video_tokens:
+            raise ValueError(
+                f"expected {expected_video_tokens} video grid IDs, got {video_grid_ids.shape[2]}"
+            )
+        if vggt_grid_ids.shape[2] != expected_vggt_tokens:
+            raise ValueError(
+                f"expected {expected_vggt_tokens} VGGT grid IDs, got {vggt_grid_ids.shape[2]}"
+            )
+        video_grid_ids = video_grid_ids.transpose(1, 2).reshape(
+            video_grid_ids.shape[0], num_frames, video_tokens_per_frame, 4
+        )
+        vggt_grid_ids = vggt_grid_ids.transpose(1, 2).reshape(
+            vggt_grid_ids.shape[0], num_frames, vggt_tokens_per_frame, 4
+        )
+        return pack_visual_tokens(video_grid_ids, vggt_grid_ids).flatten(1, 2).transpose(1, 2)
+
+    def _pack_visual_values(self, video_values, vggt_values, layout):
+        expected_video = layout.num_frames * layout.video_tokens_per_frame
+        expected_vggt = layout.num_frames * layout.vggt_tokens_per_frame
+        if video_values.shape[1] != expected_video:
+            raise ValueError(
+                f"expected {expected_video} video values, got {video_values.shape[1]}"
+            )
+        if vggt_values.shape[1] != expected_vggt:
+            raise ValueError(
+                f"expected {expected_vggt} VGGT values, got {vggt_values.shape[1]}"
+            )
+        video_values = video_values.reshape(
+            video_values.shape[0],
+            layout.num_frames,
+            layout.video_tokens_per_frame,
+            *video_values.shape[2:],
+        )
+        vggt_values = vggt_values.reshape(
+            vggt_values.shape[0],
+            layout.num_frames,
+            layout.vggt_tokens_per_frame,
+            *vggt_values.shape[2:],
+        )
+        return torch.cat([video_values, vggt_values], dim=2).flatten(1, 2)
+
+    def _unpack_visual_values(self, joint_values, layout):
+        expected_tokens = layout.num_frames * layout.tokens_per_frame
+        if joint_values.shape[1] != expected_tokens:
+            raise ValueError(
+                f"expected {expected_tokens} joint visual values, got {joint_values.shape[1]}"
+            )
+        joint_values = joint_values.reshape(
+            joint_values.shape[0],
+            layout.num_frames,
+            layout.tokens_per_frame,
+            *joint_values.shape[2:],
+        )
+        video_values, vggt_values = unpack_visual_tokens(
+            joint_values,
+            layout.video_tokens_per_frame,
+            layout.vggt_tokens_per_frame,
+        )
+        return video_values.flatten(1, 2), vggt_values.flatten(1, 2)
+
+    def _pack_visual_time_embeddings(
+        self,
+        video_timesteps,
+        vggt_timesteps,
+        latent_dict,
+        vggt_dict,
+        layout,
+        dtype,
+    ):
+        if (
+            video_timesteps.shape != vggt_timesteps.shape
+            or not torch.equal(video_timesteps, vggt_timesteps)
+        ):
+            raise ValueError(
+                "video and VGGT must share identical timesteps in joint visual diffusion"
+            )
+        video_temb, video_timestep_proj = self._time_embed(
+            video_timesteps,
+            latent_dict['noisy_latents'].shape[-2],
+            latent_dict['noisy_latents'].shape[-1],
+            dtype=dtype,
+        )
+        vggt_temb, vggt_timestep_proj = self._time_embed(
+            vggt_timesteps,
+            vggt_dict['noisy_latents'].shape[-2],
+            vggt_dict['noisy_latents'].shape[-1],
+            dtype=dtype,
+            vggt_mode=True,
+        )
+        return (
+            self._pack_visual_values(video_temb, vggt_temb, layout),
+            self._pack_visual_values(
+                video_timestep_proj, vggt_timestep_proj, layout
+            ),
+        )
+
+    def _time_embed(self, timesteps, H, W, dtype, vggt_mode=False, action_mode=False):
+        if action_mode:
+            pach_scale_h, pach_scale_w = (1, 1)
+        elif vggt_mode:
+            pach_scale_h, pach_scale_w = (self.vggt_patch_size[1], self.vggt_patch_size[2])
+        else:
+            pach_scale_h, pach_scale_w = (self.patch_size[1], self.patch_size[2])
         latent_time_steps = torch.repeat_interleave(
             timesteps,
             (H // pach_scale_h) *
@@ -963,52 +1247,89 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
     def forward_train(self, input_dict):
         input_dict['latent_dict']['noisy_latents'] = input_dict['latent_dict']['noisy_latents'].to(torch.bfloat16)
         input_dict['latent_dict']['latent'] = input_dict['latent_dict']['latent'].to(torch.bfloat16)
+        input_dict['vggt_dict']['noisy_latents'] = input_dict['vggt_dict']['noisy_latents'].to(torch.bfloat16)
+        input_dict['vggt_dict']['latent'] = input_dict['vggt_dict']['latent'].to(torch.bfloat16)
         input_dict['action_dict']['noisy_latents'] = input_dict['action_dict']['noisy_latents'].to(torch.bfloat16)
         input_dict['action_dict']['latent'] = input_dict['action_dict']['latent'].to(torch.bfloat16)
 
         latent_dict = input_dict['latent_dict']
+        vggt_dict = input_dict['vggt_dict']
         action_dict = input_dict['action_dict']
         batch_size = latent_dict['noisy_latents'].shape[0]
 
-        latent_hidden_states = self._input_embed(latent_dict['noisy_latents'], input_type='latent').flatten(0, 1)[None]
+        joint_visual_states, layout = self._pack_visual_hidden_states(
+            latent_dict['noisy_latents'], vggt_dict['noisy_latents']
+        )
+        condition_joint_visual_states, condition_layout = self._pack_visual_hidden_states(
+            latent_dict['latent'], vggt_dict['latent']
+        )
+        if condition_layout != layout:
+            raise ValueError("noisy and clean visual layouts must match")
+        joint_visual_states = joint_visual_states.flatten(1, 2).flatten(0, 1)[None]
+        condition_joint_visual_states = condition_joint_visual_states.flatten(1, 2).flatten(0, 1)[None]
         action_hidden_states = self._input_embed(action_dict['noisy_latents'], input_type='action').flatten(0, 1)[None]
         text_hidden_states = self._input_embed(latent_dict["text_emb"], input_type='text')
 
         text_hidden_states = text_hidden_states.flatten(0, 1)[None]
 
-        condition_latent_hidden_states = self._input_embed(latent_dict['latent'], input_type='latent').flatten(0, 1)[None]
         condition_action_hidden_states = self._input_embed(action_dict['latent'], input_type='action').flatten(0, 1)[None]
 
-        hidden_states = torch.cat([latent_hidden_states, 
-                                   condition_latent_hidden_states,
+        hidden_states = torch.cat([joint_visual_states,
+                                   condition_joint_visual_states,
                                    action_hidden_states, 
                                    condition_action_hidden_states], dim=1)
 
-
-        latent_grid_id = latent_dict['grid_id'].permute(1, 0, 2).flatten(1)[None]
+        visual_grid_id = self._pack_visual_grid_ids(
+            latent_dict['grid_id'],
+            vggt_dict['grid_id'],
+            layout.num_frames,
+            layout.video_tokens_per_frame,
+            layout.vggt_tokens_per_frame,
+        ).permute(1, 0, 2).flatten(1)[None]
         action_grid_id = action_dict['grid_id'].permute(1, 0, 2).flatten(1)[None]
-        full_grid_id = torch.cat([latent_grid_id] * 2 + [action_grid_id] * 2, dim=2)
+        full_grid_id = torch.cat([visual_grid_id] * 2 + [action_grid_id] * 2, dim=2)
 
         rotary_emb = self.rope(full_grid_id)[:, :, None] 
 
-        latent_time_steps = torch.cat(
-            [latent_dict['timesteps'].flatten(0, 1), latent_dict['cond_timesteps'].flatten(0, 1)]
-        )[None]
-        action_time_steps = torch.cat(
-            [action_dict['timesteps'].flatten(0, 1), action_dict['cond_timesteps'].flatten(0, 1)]
-        )[None]
-        latent_temb, latent_timestep_proj =self._time_embed(latent_time_steps, 
-                        latent_dict['noisy_latents'].shape[-2], 
-                        latent_dict['noisy_latents'].shape[-1], 
-                        dtype=hidden_states.dtype, 
-                        action_mode=False)
-        action_temb, action_timestep_proj = self._time_embed(action_time_steps,
+        visual_temb, visual_timestep_proj = self._pack_visual_time_embeddings(
+            latent_dict['timesteps'],
+            vggt_dict['timesteps'],
+            latent_dict,
+            vggt_dict,
+            layout,
+            hidden_states.dtype,
+        )
+        condition_visual_temb, condition_visual_timestep_proj = self._pack_visual_time_embeddings(
+            latent_dict['cond_timesteps'],
+            vggt_dict['cond_timesteps'],
+            latent_dict,
+            vggt_dict,
+            layout,
+            hidden_states.dtype,
+        )
+        action_temb, action_timestep_proj = self._time_embed(action_dict['timesteps'],
                         action_dict['noisy_latents'].shape[-2], 
                         action_dict['noisy_latents'].shape[-1], 
                         dtype=hidden_states.dtype, 
                         action_mode=True)
-        temb = torch.cat([latent_temb, action_temb], dim=1)
-        timestep_proj = torch.cat([latent_timestep_proj, action_timestep_proj], dim=1)
+        condition_action_temb, condition_action_timestep_proj = self._time_embed(
+                        action_dict['cond_timesteps'],
+                        action_dict['noisy_latents'].shape[-2],
+                        action_dict['noisy_latents'].shape[-1],
+                        dtype=hidden_states.dtype,
+                        action_mode=True)
+        temb = torch.cat([
+            visual_temb.flatten(0, 1)[None],
+            condition_visual_temb.flatten(0, 1)[None],
+            action_temb.flatten(0, 1)[None],
+            condition_action_temb.flatten(0, 1)[None],
+        ], dim=1)
+        timestep_proj = torch.cat([
+            visual_timestep_proj.flatten(0, 1)[None],
+            condition_visual_timestep_proj.flatten(0, 1)[None],
+            action_timestep_proj.flatten(0, 1)[None],
+            condition_action_timestep_proj.flatten(0, 1)[None],
+        ], dim=1)
 
         total_length = hidden_states.shape[1]
         padded_length = (128 - total_length % 128) % 128
@@ -1017,19 +1338,20 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         temb = F.pad(temb, (0, 0, 0, padded_length))
         timestep_proj = F.pad(timestep_proj, (0, 0, 0, 0, 0, padded_length))
 
-        split_list = [latent_hidden_states.shape[1], 
-                      condition_latent_hidden_states.shape[1], 
+        split_list = [joint_visual_states.shape[1],
+                      condition_joint_visual_states.shape[1],
                       action_hidden_states.shape[1], 
                       condition_action_hidden_states.shape[1],
                       padded_length]
 
         attn_mask, cross_attn_mask = SDPAAttnFunc.init_mask(
-                               latent_dict['noisy_latents'].shape, 
+                               batch_size,
+                               layout.num_frames,
+                               layout.tokens_per_frame,
                                action_dict['noisy_latents'].shape, 
                                padded_length, 
                                input_dict["chunk_size"],
                                window_size=input_dict['window_size'],
-                               patch_size=self.patch_size,
                                device=hidden_states.device,
                                dtype=hidden_states.dtype)
 
@@ -1049,21 +1371,96 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         hidden_states = (self.norm_out(hidden_states.float()) *
                                 (1. + scale) +
                                 shift).type_as(hidden_states)
-        latent_hidden_states, _, action_hidden_states, _, _ = torch.split(hidden_states, split_list, dim=1)
+        joint_visual_states, _, action_hidden_states, _, _ = torch.split(hidden_states, split_list, dim=1)
+        joint_visual_states = joint_visual_states.reshape(
+            batch_size, layout.num_frames * layout.tokens_per_frame, -1
+        )
+        latent_hidden_states, vggt_hidden_states = self._unpack_visual_values(
+            joint_visual_states, layout
+        )
         latent_hidden_states = self.proj_out(latent_hidden_states)
         latent_hidden_states = rearrange(latent_hidden_states,
-                                             '1 (b l) (n c) -> b (l n) c',
-                                             n=math.prod(self.patch_size), b=batch_size)  #
+                                             'b l (n c) -> b (l n) c',
+                                             n=math.prod(self.patch_size))  #
+        vggt_hidden_states = self.vggt_proj_out(vggt_hidden_states)
+        vggt_hidden_states = rearrange(vggt_hidden_states,
+                                             'b l (n c) -> b (l n) c',
+                                             n=math.prod(self.vggt_patch_size))  #
         action_hidden_states = self.action_proj_out(action_hidden_states)
         action_hidden_states = rearrange(action_hidden_states,
                                              '1 (b l) c -> b l c',
                                              b=batch_size)  #
 
-        return latent_hidden_states, action_hidden_states
+        return latent_hidden_states, vggt_hidden_states, action_hidden_states
+
+    def _infer_joint(
+        self,
+        latent_dict,
+        vggt_dict,
+        update_cache=0,
+        cache_name="pos",
+    ):
+        hidden_states, layout = self._pack_visual_hidden_states(
+            latent_dict['noisy_latents'], vggt_dict['noisy_latents']
+        )
+        hidden_states = hidden_states.flatten(1, 2)
+
+        text_hidden_states = self.condition_embedder.text_embedder(latent_dict["text_emb"])
+        full_grid_id = self._pack_visual_grid_ids(
+            latent_dict['grid_id'],
+            vggt_dict['grid_id'],
+            layout.num_frames,
+            layout.video_tokens_per_frame,
+            layout.vggt_tokens_per_frame,
+        )
+        rotary_emb = self.rope(full_grid_id)[:, :, None]
+
+        temb, timestep_proj = self._pack_visual_time_embeddings(
+            latent_dict['timesteps'],
+            vggt_dict['timesteps'],
+            latent_dict,
+            vggt_dict,
+            layout,
+            hidden_states.dtype,
+        )
+
+        for block in self.blocks:
+            hidden_states = block(
+                hidden_states,
+                text_hidden_states,
+                timestep_proj,
+                rotary_emb,
+                update_cache=update_cache,
+                cache_name=cache_name,
+            )
+
+        temb_scale_shift_table = (self.scale_shift_table[None] + temb[:, :, None])
+        shift, scale = rearrange(temb_scale_shift_table, 'b l n c -> b n l c').chunk(2, dim=1)
+        hidden_states = (self.norm_out(hidden_states.float()) *
+            (1. + scale.squeeze(1).to(hidden_states.device)) +
+            shift.squeeze(1).to(hidden_states.device)).type_as(hidden_states)
+
+        latent_hidden_states, vggt_hidden_states = self._unpack_visual_values(
+            hidden_states, layout
+        )
+        latent_hidden_states = self.proj_out(latent_hidden_states)
+        latent_hidden_states = rearrange(
+            latent_hidden_states,
+            'b l (n c) -> b (l n) c',
+            n=math.prod(self.patch_size),
+        )
+        vggt_hidden_states = self.vggt_proj_out(vggt_hidden_states)
+        vggt_hidden_states = rearrange(
+            vggt_hidden_states,
+            'b l (n c) -> b (l n) c',
+            n=math.prod(self.vggt_patch_size),
+        )
+        return latent_hidden_states, vggt_hidden_states
 
     def forward(
         self,
         input_dict,
+        vggt_dict=None,
         update_cache=0,
         cache_name="pos",
         action_mode=False,
@@ -1090,6 +1487,13 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         """
         if train_mode:
             return self.forward_train(input_dict)
+        if vggt_dict is not None:
+            return self._infer_joint(
+                input_dict,
+                vggt_dict,
+                update_cache=update_cache,
+                cache_name=cache_name,
+            )
         if action_mode:  # action input emb
             latent_hidden_states = rearrange(input_dict['noisy_latents'],
                                              'b c f h w -> b (f h w) c')
@@ -1150,10 +1554,13 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
 
 if __name__ == '__main__':
     model = WanTransformer3DModel(patch_size=[1, 2, 2],
+                                  vggt_patch_size=[1, 1, 1],
                                   num_attention_heads=24,
                                   attention_head_dim=128,
                                   in_channels=48,
                                   out_channels=48,
+                                  vggt_in_channels=2048,
+                                  vggt_out_channels=2048,
                                   action_dim=30,
                                   text_dim=4096,
                                   freq_dim=256,

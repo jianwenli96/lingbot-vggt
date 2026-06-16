@@ -4,10 +4,11 @@ import concurrent.futures
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+from einops import rearrange
 
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
-__all__ = ['get_mesh_id', 'save_async', 'data_seq_to_patch', 'visualize_attn_mask']
+__all__ = ['get_mesh_id', 'save_async', 'data_seq_to_patch', 'visualize_attn_mask', 'merge_vggt_latents']
 
 
 def data_seq_to_patch(
@@ -91,6 +92,42 @@ def warmup_constant_lambda(current_step, warmup_steps=1000):
     if current_step < warmup_steps:
         return float(current_step) / float(max(1, warmup_steps))
     return 1.0
+
+
+def merge_vggt_latents(
+    vggt_latents: torch.Tensor,
+    target_num_frames: int,
+    frame_mode: str,
+    pad_first: bool = True
+) -> torch.Tensor:
+    """Merge per-source-frame VGGT latents to Wan VAE latent-frame layout."""
+    if frame_mode != "concat":
+        raise NotImplementedError(
+            f"vggt_latent_frame_mode={frame_mode!r} is not implemented; only 'concat' is supported."
+        )
+    if vggt_latents.ndim != 4:
+        raise ValueError(
+            f"vggt_latents must have shape [F, H, W, C], got {tuple(vggt_latents.shape)}"
+        )
+    if target_num_frames < 1:
+        raise ValueError(f"target_num_frames must be >= 1, got {target_num_frames}")
+
+    required_num_frames = 1 + 4 * (target_num_frames - 1) if pad_first else 4 * target_num_frames
+    if vggt_latents.shape[0] != required_num_frames:
+        raise ValueError(
+            "concat mode requires VGGT frame count to equal "
+            f"1 + 4 * (target_num_frames - 1) or 4 * target_num_frames, got {vggt_latents.shape[0]} and "
+            f"target_num_frames={target_num_frames}"
+        )
+
+    num_frame = vggt_latents.shape[0]
+    if pad_first and num_frame % 4 != 0:
+        pad_f = 4 - (num_frame % 4)
+        pad_latents = vggt_latents[0:1].expand(pad_f, -1, -1, -1)
+        vggt_latents = torch.cat([pad_latents, vggt_latents], dim=0)
+    vggt_latents = rearrange(vggt_latents, '(m k) h w c -> m (k h) w c', k=4)
+
+    return vggt_latents
 
 
 def visualize_attn_mask(mask, tokens=None, title="Attention Mask", save_path="attention_mask.png"):
