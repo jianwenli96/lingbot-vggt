@@ -1,5 +1,6 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import concurrent.futures
+import math
 
 import numpy as np
 import torch
@@ -8,7 +9,11 @@ from einops import rearrange
 
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
-__all__ = ['get_mesh_id', 'save_async', 'data_seq_to_patch', 'visualize_attn_mask', 'merge_vggt_latents']
+__all__ = [
+    'get_mesh_id', 'save_async', 'data_seq_to_patch', 'sample_timestep_id',
+    'warmup_constant_lambda', 'warmup_cosine_decay_lambda',
+    'visualize_attn_mask', 'merge_vggt_latents'
+]
 
 
 def data_seq_to_patch(
@@ -92,6 +97,16 @@ def warmup_constant_lambda(current_step, warmup_steps=1000):
     if current_step < warmup_steps:
         return float(current_step) / float(max(1, warmup_steps))
     return 1.0
+
+
+def warmup_cosine_decay_lambda(current_step, warmup_steps=1000, total_steps=100000, min_lr_ratio=0.0):
+    if current_step < warmup_steps:
+        return float(current_step) / float(max(1, warmup_steps))
+
+    decay_steps = max(1, total_steps - warmup_steps)
+    decay_progress = min(float(current_step - warmup_steps) / float(decay_steps), 1.0)
+    cosine_ratio = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
+    return float(min_lr_ratio) + (1.0 - float(min_lr_ratio)) * cosine_ratio
 
 
 def merge_vggt_latents(

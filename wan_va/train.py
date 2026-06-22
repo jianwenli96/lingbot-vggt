@@ -47,7 +47,7 @@ from utils import (
     get_mesh_id, 
     sample_timestep_id,
     data_seq_to_patch,
-    warmup_constant_lambda,
+    warmup_cosine_decay_lambda,
     FlowMatchScheduler
 )
 
@@ -113,8 +113,16 @@ class Trainer:
             foreach=False,
         )
 
-        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, 
-            lr_lambda=lambda step: warmup_constant_lambda(step, warmup_steps=config.warmup_steps))
+        min_lr_ratio = getattr(config, 'min_lr_ratio', 0.0)
+        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            self.optimizer,
+            lr_lambda=lambda step: warmup_cosine_decay_lambda(
+                step,
+                warmup_steps=config.warmup_steps,
+                total_steps=config.num_steps,
+                min_lr_ratio=min_lr_ratio,
+            )
+        )
 
         # Setup dataloaders
         logger.info("Setting up datasets...")
