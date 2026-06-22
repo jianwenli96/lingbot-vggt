@@ -9,7 +9,7 @@ MASTER_PORT=${MASTER_PORT:-"29501"}
 PORT=${PORT:-"1106"}
 LOG_RANK=${LOG_RANK:-"0"}
 TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE:-"http://localhost:29510"}
-CONFIG_NAME=${CONFIG_NAME:-"robotwin_i2av"}
+CONFIG_NAME=${CONFIG_NAME:-"aloha_3dcmp_server"}
 
 overrides=""
 if [ $# -ne 0 ]; then
@@ -24,7 +24,7 @@ torchft_lighthouse=${TORCHFT_LIGHTHOUSE}
 config_name=${CONFIG_NAME}
 
 ## cmd setting
-export HF_DATASETS_CACHE="/efs-gy1/Caches/hf_dataset_cache"
+export HF_DATASETS_CACHE="/mi/data2T/Caches/hf_dataset_cache"
 export TOKENIZERS_PARALLELISM=false
 PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" TORCHFT_LIGHTHOUSE=${torchft_lighthouse} \
 python -m torch.distributed.run \
