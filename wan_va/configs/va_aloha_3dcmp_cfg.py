@@ -8,7 +8,7 @@ va_aloha_3dcmp_cfg.update(va_shared_cfg)
 
 va_aloha_3dcmp_cfg.wan22_pretrained_model_name_or_path = '/mi/data2T/Embodied-AI/ckpts/lingbot-vggt-base'
 
-va_aloha_3dcmp_cfg.attn_window = 72
+va_aloha_3dcmp_cfg.attn_window = 30
 va_aloha_3dcmp_cfg.frame_chunk_size = 2
 va_aloha_3dcmp_cfg.env_type = 'aloha_tshape'
 

@@ -1,5 +1,4 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
-# Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 from easydict import EasyDict
 from .va_aloha_3dcmp_cfg import va_aloha_3dcmp_cfg
 import os

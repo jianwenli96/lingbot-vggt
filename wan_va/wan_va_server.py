@@ -46,6 +46,11 @@ from utils import (
     merge_vggt_latents,
 )
 
+# for embedding offload
+import hashlib
+
+def md5_hash(s):
+    return hashlib.md5(s.encode()).hexdigest()
 
 class VA_Server:
 
@@ -75,7 +80,7 @@ class VA_Server:
             os.path.join(job_config.wan22_pretrained_model_name_or_path,
                          'vae'),
             torch_dtype=self.dtype,
-            torch_device='cpu' if self.enable_offload else self.device,
+            torch_device=self.device,
         )
         self.streaming_vae = WanVAEStreamingWrapper(self.vae)
 
@@ -118,19 +123,13 @@ class VA_Server:
         self.vggt_adapter = VGGTAdapter.from_pretrained(
             vggt_adapter_config=vggt_adapter_config,
             vggt_pretrained_path=job_config.vggt_pretrained_model_name_or_path,
-            device=self.device.type,
+            device='cpu',
             torch_dtype=self.dtype,
         )
         self.vggt_adapter.eval()
 
         if self.env_type == 'robotwin_tshape' or self.env_type == 'aloha_tshape':
-            vae_half = load_vae(
-                os.path.join(job_config.wan22_pretrained_model_name_or_path,
-                             'vae'),
-                torch_dtype=self.dtype,
-                torch_device='cpu' if self.enable_offload else self.device,
-            )
-            self.streaming_vae_half = WanVAEStreamingWrapper(vae_half)
+            self.streaming_vae_half = WanVAEStreamingWrapper(self.vae)
 
     def _get_t5_prompt_embeds(
         self,
@@ -379,6 +378,7 @@ class VA_Server:
         return input_dict
 
     def _encode_obs(self, obs):
+        torch.cuda.empty_cache()
         images = obs['obs']
         if not isinstance(images, list):
             images = [images]
@@ -428,9 +428,12 @@ class VA_Server:
         latents_std = torch.tensor(self.vae.config.latents_std).to(mu.device)
         mu_norm = self.normalize_latents(mu, latents_mean, 1.0 / latents_std)
         video_latent = torch.cat(mu_norm.split(1, dim=0), dim=-1)
+
+        torch.cuda.empty_cache()
         return video_latent.to(self.device)
 
     def _encode_vggt_obs(self, obs, target_num_frames):
+        torch.cuda.empty_cache()
         images = obs['obs']
         if not isinstance(images, list):
             images = [images]
@@ -454,10 +457,13 @@ class VA_Server:
             resized_view_frame_tensors.append(frames)
         vggt_images = torch.stack(resized_view_frame_tensors, dim=2).to(
             device=self.device, dtype=self.dtype)
+        self.vggt_adapter.to(self.device)  # 移到 GPU
         encoded = self.vggt_adapter.encode(vggt_images,
                                            return_dict=True,
                                            device=self.device.type,
                                            torch_dtype=self.dtype)
+        self.vggt_adapter.to('cpu')  # 移回 CPU
+        torch.cuda.empty_cache()
         # The images length would be 1, 4, or 8, thus set pad_first to False for 4 and 8
         vggt_latents = merge_vggt_latents(
             encoded["latents"].detach(),
@@ -468,8 +474,9 @@ class VA_Server:
 
         # Normalize vggt latents first
         vggt_latents = self.transformer.vggt_pre_norm(vggt_latents)
-
         vggt_latents = rearrange(vggt_latents, "f h w c -> 1 c f h w")
+
+        torch.cuda.empty_cache()
         return vggt_latents.to(self.device, self.dtype)
 
     def _reset(self, prompt=None):
@@ -479,6 +486,7 @@ class VA_Server:
         self.frame_st_id = 0
         self.init_latent = None
         self.init_vggt = None
+        self.pred_latent_lst = []  # 累积 latents 用于最后解码
         #### clean vae and transformer cache
         self.transformer.clear_cache(self.cache_name)
         self.streaming_vae.clear_cache()
@@ -528,19 +536,31 @@ class VA_Server:
         if prompt is None:
             self.prompt_embeds = self.negative_prompt_embeds = None
         else:
-            self.prompt_embeds, self.negative_prompt_embeds = self.encode_prompt(
-                prompt=prompt,
-                negative_prompt=None,
-                do_classifier_free_guidance=self.use_cfg,
-                num_videos_per_prompt=1,
-                prompt_embeds=None,
-                negative_prompt_embeds=None,
-                max_sequence_length=512,
-                device=self.device,
-                dtype=self.dtype,
-            )
+            prompt_hash = md5_hash(prompt)
+            # search md5 hash
+            if os.path.exists(os.path.join("prompts", prompt_hash)):
+                self.prompt_embeds = torch.load(
+                    os.path.join("prompts", prompt_hash),
+                    map_location="cpu"
+                ).to(self.device)
+                self.negative_prompt_embeds = torch.load(
+                    os.path.join("prompts", "negative_prompt_embeds"),
+                    map_location="cpu"
+                ).to(self.device)
+            else:
+                self.prompt_embeds, self.negative_prompt_embeds = self.encode_prompt(
+                    prompt=prompt,
+                    negative_prompt=None,
+                    do_classifier_free_guidance=self.use_cfg,
+                    num_videos_per_prompt=1,
+                    prompt_embeds=None,
+                    negative_prompt_embeds=None,
+                    max_sequence_length=512,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
 
-        self.exp_name = f"{prompt}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
+        self.exp_name = f"{prompt_hash}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
         self.exp_save_root = os.path.join(self.save_root, 'real', self.exp_name)
         os.makedirs(self.exp_save_root, exist_ok=True)
         torch.cuda.empty_cache()
@@ -713,11 +733,15 @@ class VA_Server:
 
         actions[:, ~self.action_mask] *= 0
 
+        # 累积 latents 用于最后解码
+        self.pred_latent_lst.append(latents.detach().cpu())
+
+        actions = self.postprocess_action(actions)
+
         save_async(latents, os.path.join(self.exp_save_root, f'latents_{frame_st_id}.pt'))
         save_async(vggt_latents, os.path.join(self.exp_save_root, f'vggt_latents_{frame_st_id}.pt'))
         save_async(actions, os.path.join(self.exp_save_root, f'actions_{frame_st_id}.pt'))
 
-        actions = self.postprocess_action(actions)
         torch.cuda.empty_cache()
         return actions, latents, vggt_latents
 
@@ -767,6 +791,7 @@ class VA_Server:
         reset = obs.get('reset', False)
         prompt = obs.get('prompt', None)
         compute_kv_cache = obs.get('compute_kv_cache', False)
+        decode_latents = obs.get('decode_latents', False)
 
         if reset:
             logger.info(f"******************* Reset server ******************")
@@ -777,6 +802,10 @@ class VA_Server:
                 f"################# Compute KV Cache #################")
             self._compute_kv_cache(obs)
             return dict()
+        elif decode_latents:
+            logger.info(f"################# Decode Latents #################")
+            video_path = self.decode_and_save_latents()
+            return dict(video_path=video_path)
         else:
             logger.info(f"################# Infer One Chunk #################")
             action, _, _ = self._infer(obs, frame_st_id=self.frame_st_id)
@@ -796,7 +825,48 @@ class VA_Server:
         video = self.vae.decode(latents, return_dict=False)[0]
         video = self.video_processor.postprocess_video(video, output_type=output_type)
         return video
-    
+
+    @torch.no_grad()
+    def decode_and_save_latents(self):
+        """
+        解码累积的 latents 并保存为视频。
+        复用 generate() 的模式。
+        """
+        if not self.pred_latent_lst:
+            logger.warning("No latents accumulated to decode")
+            return None
+
+        logger.info(f"Decoding {len(self.pred_latent_lst)} accumulated latents...")
+
+        # 拼接所有 latents
+        pred_latent = torch.cat(self.pred_latent_lst, dim=2)
+        logger.info(f"Concatenated latent shape: {pred_latent.shape}")
+
+        # 初始化 video_processor（如果需要）
+        if not hasattr(self, 'video_processor') or self.video_processor is None:
+            from diffusers.video_processor import VideoProcessor
+            self.video_processor = VideoProcessor(vae_scale_factor=1)
+
+        # 将 VAE 移到 GPU
+        if self.enable_offload:
+            self.vae = self.vae.to(self.device).to(self.dtype)
+
+        # 解码
+        decoded_video = self.decode_one_video(pred_latent.to(self.device), 'np')[0]
+        logger.info(f"Decoded video shape: {decoded_video.shape}")
+
+        # 保存视频
+        output_path = os.path.join(self.exp_save_root, 'predicted_video.mp4')
+        export_to_video(decoded_video, output_path, fps=10)
+        logger.info(f"Predicted video saved to {output_path}")
+
+        # # VAE 移回 CPU
+        if self.enable_offload:
+            self.vae = self.vae.to('cpu')
+
+        torch.cuda.empty_cache()
+        return output_path
+
     def load_init_obs(self):
         imf_dict = {v: np.array(Image.open(os.path.join(self.job_config.input_img_path, f"{v}.png")).convert("RGB")) for v in self.job_config.obs_cam_keys}
         init_obs = {}
