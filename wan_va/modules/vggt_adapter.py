@@ -13,11 +13,8 @@ import numpy as np
 from typing import Any, Dict, Optional, Tuple
 from einops import rearrange
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-
-from utils.logging import logger, init_logger
-
-from modules.visual_util import predictions_to_glb
+from wan_va.utils.logging import logger, init_logger
+from wan_va.modules.visual_util import predictions_to_glb
 from vggt_omega.models import VGGTOmega
 from vggt_omega.utils.load_fn import load_and_preprocess_images
 from vggt_omega.utils.pose_enc import encoding_to_camera
@@ -28,7 +25,12 @@ def unproject_depth_map_to_point_map(
 ) -> np.ndarray:
     """Convert depth maps to 3D world points."""
     depth = depth_map[..., 0]
-    num_frames, height, width = depth.shape
+    leading_shape = depth.shape[:-2]
+    height, width = depth.shape[-2:]
+    num_frames = int(np.prod(leading_shape))
+    depth = depth.reshape(num_frames, height, width)
+    extrinsic = extrinsic.reshape(num_frames, *extrinsic.shape[-2:])
+    intrinsic = intrinsic.reshape(num_frames, *intrinsic.shape[-2:])
 
     y, x = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
     x = np.broadcast_to(x[None], (num_frames, height, width))
@@ -54,13 +56,13 @@ def unproject_depth_map_to_point_map(
         "sij,shwj->shwi",
         np.transpose(rotation, (0, 2, 1)),
         camera_points - translation[:, None, None, :],
-    )
+    ).reshape(*leading_shape, height, width, 3)
 
 
 def save_glb(
     predictions: dict,
     output_dir: str,
-    conf_thres: float = 20.0,
+    conf_thres: float = 40.0,
     mask_black_bg: bool = False,
     mask_white_bg: bool = False,
     show_cam: bool = True,
@@ -293,7 +295,7 @@ class VGGTAdapter(nn.Module):
         Forward pass: encode images and decode to 3D geometry predictions.
 
         Args:
-            images: Input images [B, F, C, H, W] or [F, C, H, W], in range [0, 1]
+            images: Input images [B, C, F, H, W] or [C, F, H, W], in range [0, 1]
             return_latent: Whether to include latent in output
         """
         # Encode
